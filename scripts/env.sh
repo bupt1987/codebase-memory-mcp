@@ -43,7 +43,28 @@ if [[ "$OS" == "darwin" ]]; then
 fi
 
 # ── Detect parallelism ─────────────────────────────────────────
-NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+detect_nproc() {
+    local detected=""
+
+    if command -v nproc >/dev/null 2>&1; then
+        detected="$(nproc 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$detected" ]] && command -v getconf >/dev/null 2>&1; then
+        detected="$(getconf _NPROCESSORS_ONLN 2>/dev/null || getconf NPROCESSORS_ONLN 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$detected" ]] && command -v sysctl >/dev/null 2>&1; then
+        detected="$(sysctl -n hw.ncpu 2>/dev/null || true)"
+    fi
+
+    case "$detected" in
+        ""|0|*[!0-9]*) echo 4 ;;
+        *) echo "$detected" ;;
+    esac
+}
+
+NPROC="${NPROC:-$(detect_nproc)}"
 
 # ── Verify compiler is available for target arch ───────────────
 verify_compiler() {

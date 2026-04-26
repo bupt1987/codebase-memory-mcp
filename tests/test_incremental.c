@@ -20,6 +20,7 @@
 #include <foundation/mem.h>
 
 #include <stdarg.h>
+#include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -34,6 +35,8 @@ static char g_repodir[512];
 static char g_dbpath[512];
 static cbm_mcp_server_t *g_srv = NULL;
 static char *g_project = NULL;
+static char *g_old_cache_dir = NULL;
+static bool g_had_old_cache_dir = false;
 
 /* Baseline counts after full index */
 static int g_full_nodes = 0;
@@ -200,6 +203,15 @@ static int incremental_setup(void) {
     if (!cbm_mkdtemp(g_tmpdir))
         return -1;
 
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    g_had_old_cache_dir = old_cache != NULL;
+    g_old_cache_dir = old_cache ? strdup(old_cache) : NULL;
+
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", g_tmpdir);
+    cbm_mkdir(cache_dir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
     snprintf(g_repodir, sizeof(g_repodir), "%s/fastapi", g_tmpdir);
 
     /* On CI, use sparse checkout to skip docs/ and tests/ (~62% of files).
@@ -227,14 +239,7 @@ static int incremental_setup(void) {
     if (!g_project)
         return -1;
 
-    const char *home = getenv("HOME");
-    if (!home)
-        home = "/tmp";
-    snprintf(g_dbpath, sizeof(g_dbpath), "%s/.cache/codebase-memory-mcp/%s.db", home, g_project);
-
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
-    cbm_mkdir(cache_dir);
+    snprintf(g_dbpath, sizeof(g_dbpath), "%s/%s.db", cache_dir, g_project);
 
     unlink(g_dbpath);
 
@@ -264,6 +269,14 @@ static void incremental_teardown(void) {
     g_project = NULL;
 
     th_rmtree(g_tmpdir);
+    if (g_had_old_cache_dir && g_old_cache_dir) {
+        cbm_setenv("CBM_CACHE_DIR", g_old_cache_dir, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(g_old_cache_dir);
+    g_old_cache_dir = NULL;
+    g_had_old_cache_dir = false;
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1771,6 +1784,42 @@ TEST(tool_detect_changes_depth) {
     PASS();
 }
 
+TEST(tool_sync_files_ignores_deleted_path_under_cbmignore_dir) {
+    char ignore_path[512];
+    snprintf(ignore_path, sizeof(ignore_path), "%s/.cbmignore", g_repodir);
+    ASSERT_EQ(th_write_file(ignore_path, "conf/\n"), 0);
+
+    double ms;
+    char *r = call_tool_timed(
+        "sync_files", &ms,
+        "{\"repo_path\":\"%s\",\"deleted_files\":[\"conf/global_dev/time_mock.php\"]}",
+        g_repodir);
+    TOOL_OK(r, ms);
+    ASSERT_EQ(count_in_response(r, "deleted_count"), 0);
+    free(r);
+
+    unlink(ignore_path);
+    PASS();
+}
+
+TEST(tool_sync_files_defaults_to_fast_mode) {
+    char generated_path[512];
+    snprintf(generated_path, sizeof(generated_path), "%s/types.d.ts", g_repodir);
+    ASSERT_EQ(th_write_file(generated_path, "export interface GeneratedType {}\n"), 0);
+
+    double ms;
+    char *r = call_tool_timed("sync_files", &ms,
+                              "{\"repo_path\":\"%s\",\"changed_files\":[\"types.d.ts\"]}",
+                              g_repodir);
+    TOOL_OK(r, ms);
+    ASSERT_EQ(count_in_response(r, "changed_count"), 0);
+    ASSERT_EQ(count_in_response(r, "ignored_changed_count"), 1);
+    free(r);
+
+    unlink(generated_path);
+    PASS();
+}
+
 /* ── manage_adr ────────────────────────────────────────────────── */
 
 TEST(tool_adr_get) {
@@ -2965,6 +3014,8 @@ SUITE(incremental) {
     RUN_TEST(tool_detect_changes_default);
     RUN_TEST(tool_detect_changes_custom_branch);
     RUN_TEST(tool_detect_changes_depth);
+    RUN_TEST(tool_sync_files_ignores_deleted_path_under_cbmignore_dir);
+    RUN_TEST(tool_sync_files_defaults_to_fast_mode);
 
     /* Phase 16: manage_adr */
     RUN_TEST(tool_adr_get);

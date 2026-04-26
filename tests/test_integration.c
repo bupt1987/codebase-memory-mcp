@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <stdbool.h>
 
 /* ── Test fixture: temp project with Python + Go files ─────────── */
 
@@ -27,6 +28,8 @@ static char g_tmpdir[256];
 static char g_dbpath[512];
 static cbm_mcp_server_t *g_srv = NULL;
 static char *g_project = NULL;
+static char *g_old_cache_dir = NULL;
+static bool g_had_old_cache_dir = false;
 
 /* Create source files in temp directory */
 static int create_test_project(void) {
@@ -100,21 +103,22 @@ static int integration_setup(void) {
     if (create_test_project() != 0)
         return -1;
 
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    g_had_old_cache_dir = old_cache != NULL;
+    g_old_cache_dir = old_cache ? strdup(old_cache) : NULL;
+
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", g_tmpdir);
+    cbm_mkdir(cache_dir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
     /* Derive project name (same logic the pipeline uses) */
     g_project = cbm_project_name_from_path(g_tmpdir);
     if (!g_project)
         return -1;
 
     /* Build db path for direct store queries (pipeline writes here) */
-    const char *home = getenv("HOME");
-    if (!home)
-        home = "/tmp";
-    snprintf(g_dbpath, sizeof(g_dbpath), "%s/.cache/codebase-memory-mcp/%s.db", home, g_project);
-
-    /* Ensure cache dir exists */
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
-    cbm_mkdir(cache_dir);
+    snprintf(g_dbpath, sizeof(g_dbpath), "%s/%s.db", cache_dir, g_project);
 
     /* Remove stale db from previous test runs */
     unlink(g_dbpath);
@@ -160,6 +164,15 @@ static void integration_teardown(void) {
     snprintf(shm, sizeof(shm), "%s-shm", g_dbpath);
     unlink(wal);
     unlink(shm);
+
+    if (g_had_old_cache_dir && g_old_cache_dir) {
+        cbm_setenv("CBM_CACHE_DIR", g_old_cache_dir, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(g_old_cache_dir);
+    g_old_cache_dir = NULL;
+    g_had_old_cache_dir = false;
 }
 
 /* ══════════════════════════════════════════════════════════════════

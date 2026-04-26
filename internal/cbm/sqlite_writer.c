@@ -17,6 +17,7 @@
 #include "sqlite_writer.h"
 #include "foundation/constants.h"
 #include "foundation/compat_thread.h"
+#include "foundation/log.h"
 #include "foundation/profile.h"
 
 #include <stddef.h> // NULL
@@ -25,6 +26,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <errno.h>
 
 #define CBM_PAGE_SIZE 65536
 
@@ -1645,6 +1647,54 @@ typedef struct {
     int token_vec_count;
 } write_db_ctx_t;
 
+static void log_write_db_error(const char *phase, int rc) {
+    char rc_buf[32];
+    snprintf(rc_buf, sizeof(rc_buf), "%d", rc);
+    cbm_log_error("write_db.err", "phase", phase, "rc", rc_buf);
+}
+
+static void log_write_db_open_error(const char *path, int errnum) {
+    char err_buf[32];
+    snprintf(err_buf, sizeof(err_buf), "%d", errnum);
+    cbm_log_error("write_db.err", "phase", "open", "rc", "-1", "errno", err_buf, "message",
+                  strerror(errnum), "path", path ? path : "");
+}
+
+static void log_write_db_roots(const char *phase, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    char b1[32];
+    char b2[32];
+    char b3[32];
+    char b4[32];
+    snprintf(b1, sizeof(b1), "%u", a);
+    snprintf(b2, sizeof(b2), "%u", b);
+    snprintf(b3, sizeof(b3), "%u", c);
+    snprintf(b4, sizeof(b4), "%u", d);
+    cbm_log_error("write_db.err", "phase", phase, "root1", b1, "root2", b2, "root3", b3,
+                  "root4", b4);
+}
+
+static void log_write_db_edge_roots(uint32_t source_root, uint32_t target_root,
+                                    uint32_t type_root, uint32_t tgt_type_root,
+                                    uint32_t src_type_root, uint32_t url_path_root,
+                                    uint32_t auto_root) {
+    char b1[32];
+    char b2[32];
+    char b3[32];
+    char b4[32];
+    char b5[32];
+    char b6[32];
+    char b7[32];
+    snprintf(b1, sizeof(b1), "%u", source_root);
+    snprintf(b2, sizeof(b2), "%u", target_root);
+    snprintf(b3, sizeof(b3), "%u", type_root);
+    snprintf(b4, sizeof(b4), "%u", tgt_type_root);
+    snprintf(b5, sizeof(b5), "%u", src_type_root);
+    snprintf(b6, sizeof(b6), "%u", url_path_root);
+    snprintf(b7, sizeof(b7), "%u", auto_root);
+    cbm_log_error("write_db.err", "phase", "edge_indexes", "source", b1, "target", b2, "type",
+                  b3, "target_type", b4, "source_type", b5, "url_path", b6, "auto", b7);
+}
+
 /* Callback type for building a record from an item at index i. */
 typedef uint8_t *(*build_record_fn)(const void *items, int i, int *out_len);
 typedef int64_t (*get_rowid_fn)(const void *items, int i);
@@ -1875,6 +1925,7 @@ static int build_node_indexes(FILE *fp, uint32_t *next_page, CBMDumpNode *nodes,
     *qn_root =
         build_node_index_sorted(fp, next_page, nodes, node_count, nsorts[NSORT_QN].perm, ncol_qn);
     if (node_count > 0 && (!*label_root || !*name_root || !*file_root || !*qn_root)) {
+        log_write_db_roots("node_indexes", *label_root, *name_root, *file_root, *qn_root);
         return ERR_SORT_FAILED;
     }
     return 0;
@@ -1901,6 +1952,8 @@ static int build_edge_indexes(FILE *fp, uint32_t *next_page, CBMDumpEdge *edges,
                                          esorts[ESORT_SRC_TGT_TYPE].perm, ecell_src_tgt_type);
     if (edge_count > 0 && (!*source_root || !*target_root || !*type_root || !*tgt_type_root ||
                            !*src_type_root || !*url_path_root || !*auto_root)) {
+        log_write_db_edge_roots(*source_root, *target_root, *type_root, *tgt_type_root,
+                                *src_type_root, *url_path_root, *auto_root);
         return ERR_SORT_FAILED;
     }
     return 0;
@@ -1931,6 +1984,7 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
                  CBMDumpTokenVec *token_vecs, int token_vec_count) {
     FILE *fp = fopen(path, "wb");
     if (!fp) {
+        log_write_db_open_error(path, errno);
         return CBM_NOT_FOUND;
     }
 
@@ -1956,6 +2010,7 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
     uint32_t token_vecs_root;
     int rc = write_data_tables(&w, &nodes_root, &edges_root, &vectors_root, &token_vecs_root);
     if (rc != 0) {
+        log_write_db_error("data_tables", rc);
         (void)fclose(fp);
         return rc;
     }
@@ -2010,6 +2065,7 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
                                  &idx_nodes_name_root, &idx_nodes_file_root, &autoindex_nodes_root);
     CBM_PROF_END_N("write_db", "4_node_indexes_seq", t_node_idx, node_count * NODE_SORT_THREADS);
     if (nrc != 0) {
+        log_write_db_error("node_indexes", nrc);
         (void)fclose(fp);
         return nrc;
     }
@@ -2028,6 +2084,7 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
                                  &idx_edges_url_path_root, &autoindex_edges_root);
     CBM_PROF_END_N("write_db", "5_edge_indexes_seq", t_edge_idx, edge_count * EDGE_SORT_THREADS);
     if (erc != 0) {
+        log_write_db_error("edge_indexes", erc);
         (void)fclose(fp);
         return erc;
     }
@@ -2133,6 +2190,7 @@ int cbm_write_db(const char *path, const char *project, const char *root_path,
     int master_count = sizeof(master) / sizeof(master[0]);
     int rc2 = write_master_page1(fp, master, master_count, next_page);
     if (rc2 != 0) {
+        log_write_db_error("master_page", rc2);
         (void)fclose(fp);
         return rc2;
     }

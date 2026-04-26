@@ -45,6 +45,21 @@ static inline void *intptr_to_ptr(intptr_t v) {
     return p;
 }
 
+static double gb_elapsed_ms(struct timespec start) {
+    struct timespec now;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double)(now.tv_sec - start.tv_sec) * 1000.0 +
+           (double)(now.tv_nsec - start.tv_nsec) / 1000000.0;
+}
+
+static const char *gb_itoa(int value) {
+    static _Thread_local char bufs[4][16];
+    static _Thread_local int idx;
+    idx = (idx + 1) & 3;
+    snprintf(bufs[idx], sizeof(bufs[idx]), "%d", value);
+    return bufs[idx];
+}
+
 /* ── Internal types ──────────────────────────────────────────────── */
 
 /* Edge key for dedup hash table — composite key as string "srcID:tgtID:type" */
@@ -213,6 +228,30 @@ static void remove_node_from_ptr_array(node_ptr_array_t *arr, int64_t node_id) {
             return;
         }
     }
+}
+
+static bool node_is_live(cbm_gbuf_t *gb, const cbm_gbuf_node_t *n) {
+    return n && n->qualified_name && cbm_ht_get(gb->node_by_qn, n->qualified_name);
+}
+
+static void unindex_node_for_delete(cbm_gbuf_t *gb, cbm_gbuf_node_t *n,
+                                    CBMHashTable *deleted_set) {
+    char id_buf[CBM_SZ_32];
+    make_id_key(id_buf, sizeof(id_buf), n->id);
+    cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
+
+    remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_label, n->label), n->id);
+    remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_name, n->name), n->id);
+
+    cbm_ht_delete(gb->node_by_qn, n->qualified_name);
+    const char *stored_key = cbm_ht_get_key(gb->node_by_id, id_buf);
+    cbm_ht_delete(gb->node_by_id, id_buf);
+    free((void *)stored_key);
+
+    /* NULL out QN so dump's liveness check fails even if a new node with the
+     * same QN is inserted later via merge. */
+    free(n->qualified_name);
+    n->qualified_name = NULL;
 }
 
 /* Remove an edge from all indexes (dedup + source_type + target_type + type). */
@@ -687,7 +726,7 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label) {
     return 0;
 }
 
-int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
+int cbm_gbuf_delete_by_file_logged(cbm_gbuf_t *gb, const char *file_path, bool log_info) {
     if (!gb || !file_path) {
         return CBM_NOT_FOUND;
     }
@@ -703,28 +742,11 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
         if (!n->file_path || strcmp(n->file_path, file_path) != 0) {
             continue;
         }
-        if (!n->qualified_name || !cbm_ht_get(gb->node_by_qn, n->qualified_name)) {
+        if (!node_is_live(gb, n)) {
             continue;
         }
 
-        char id_buf[CBM_SZ_32];
-        make_id_key(id_buf, sizeof(id_buf), n->id);
-        cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
-
-        /* Remove from secondary indexes */
-        remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_label, n->label), n->id);
-        remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_name, n->name), n->id);
-
-        /* Remove from primary indexes */
-        cbm_ht_delete(gb->node_by_qn, n->qualified_name);
-        const char *stored_key = cbm_ht_get_key(gb->node_by_id, id_buf);
-        cbm_ht_delete(gb->node_by_id, id_buf);
-        free((void *)stored_key);
-
-        /* NULL out QN so dump's liveness check (cbm_ht_get by QN) fails
-         * even if a new node with the same QN is inserted later via merge. */
-        free(n->qualified_name);
-        n->qualified_name = NULL;
+        unindex_node_for_delete(gb, n, deleted_set);
         deleted_count++;
     }
 
@@ -738,13 +760,75 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
 
     cbm_ht_foreach(deleted_set, free_key_only, NULL);
     cbm_ht_free(deleted_set);
-    {
+    if (log_info) {
         char s_buf[CBM_SZ_16];
         char d_buf[CBM_SZ_16];
         snprintf(s_buf, sizeof(s_buf), "%d", scanned);
         snprintf(d_buf, sizeof(d_buf), "%d", deleted_count);
         cbm_log_info("gbuf.delete_by_file", "file", file_path, "scanned", s_buf, "deleted", d_buf);
     }
+    return deleted_count;
+}
+
+int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
+    return cbm_gbuf_delete_by_file_logged(gb, file_path, true);
+}
+
+int cbm_gbuf_delete_by_files_logged(cbm_gbuf_t *gb, const char **file_paths, int file_count,
+                                    bool log_info) {
+    if (!gb || file_count < 0 || (file_count > 0 && !file_paths)) {
+        return CBM_NOT_FOUND;
+    }
+    if (file_count == 0) {
+        return 0;
+    }
+
+    CBMHashTable *file_set = cbm_ht_create((uint32_t)(file_count * PAIR_LEN + SKIP_ONE));
+    for (int i = 0; i < file_count; i++) {
+        const char *path = file_paths[i];
+        if (!path || path[0] == '\0' || cbm_ht_has(file_set, path)) {
+            continue;
+        }
+        cbm_ht_set(file_set, strdup(path), intptr_to_ptr(SKIP_ONE));
+    }
+    int unique_files = (int)cbm_ht_count(file_set);
+    if (unique_files == 0) {
+        cbm_ht_free(file_set);
+        return 0;
+    }
+
+    CBMHashTable *deleted_set = cbm_ht_create(CBM_SZ_64);
+    int deleted_count = 0;
+    int scanned = 0;
+
+    for (int i = 0; i < gb->nodes.count; i++) {
+        cbm_gbuf_node_t *n = gb->nodes.items[i];
+        scanned++;
+        if (!node_is_live(gb, n) || !n->file_path || !cbm_ht_has(file_set, n->file_path)) {
+            continue;
+        }
+        unindex_node_for_delete(gb, n, deleted_set);
+        deleted_count++;
+    }
+
+    if (deleted_count > 0) {
+        cascade_delete_edges(gb, deleted_set);
+        if (log_info) {
+            char f_buf[CBM_SZ_16];
+            char s_buf[CBM_SZ_16];
+            char d_buf[CBM_SZ_16];
+            snprintf(f_buf, sizeof(f_buf), "%d", unique_files);
+            snprintf(s_buf, sizeof(s_buf), "%d", scanned);
+            snprintf(d_buf, sizeof(d_buf), "%d", deleted_count);
+            cbm_log_info("gbuf.delete_by_files", "files", f_buf, "scanned", s_buf, "deleted",
+                         d_buf);
+        }
+    }
+
+    cbm_ht_foreach(deleted_set, free_key_only, NULL);
+    cbm_ht_free(deleted_set);
+    cbm_ht_foreach(file_set, free_key_only, NULL);
+    cbm_ht_free(file_set);
     return deleted_count;
 }
 
@@ -1382,6 +1466,11 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
                           dump_edges, edge_idx, gb->dump_vectors, gb->dump_vector_count,
                           gb->dump_token_vecs, gb->dump_token_vec_count);
     CBM_PROF_END_N("dump", "6_write_db_btree", t_write_db, node_idx + edge_idx);
+    if (rc != 0) {
+        char rc_buf[32];
+        snprintf(rc_buf, sizeof(rc_buf), "%d", rc);
+        cbm_log_error("gbuf.dump.err", "phase", "write_db", "rc", rc_buf);
+    }
 
     log_dump_summary(node_idx, edge_idx);
     free_dump_resources(url_paths, edge_idx, dump_edges, dump_nodes, temp_to_final);
@@ -1519,4 +1608,176 @@ int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store) {
 
     free(temp_to_real);
     return 0;
+}
+
+int cbm_gbuf_merge_delta_into_store(cbm_gbuf_t *gb, cbm_store_t *store,
+                                    const char **dirty_paths, int dirty_path_count,
+                                    const int64_t *seed_temp_to_real,
+                                    int64_t seed_temp_to_real_count,
+                                    int *merged_nodes_out, int *merged_edges_out) {
+    if (!gb || !store || dirty_path_count < 0 ||
+        (dirty_path_count > 0 && !dirty_paths) || seed_temp_to_real_count < 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (merged_nodes_out) {
+        *merged_nodes_out = 0;
+    }
+    if (merged_edges_out) {
+        *merged_edges_out = 0;
+    }
+
+    int64_t max_temp_id = gb->next_id > 0 ? gb->next_id : 1;
+    int64_t *temp_to_real = calloc((size_t)max_temp_id, sizeof(int64_t));
+    if (!temp_to_real) {
+        return CBM_NOT_FOUND;
+    }
+    if (seed_temp_to_real && seed_temp_to_real_count > 0) {
+        int64_t copy_count = seed_temp_to_real_count < max_temp_id ? seed_temp_to_real_count
+                                                                   : max_temp_id;
+        memcpy(temp_to_real, seed_temp_to_real, (size_t)copy_count * sizeof(int64_t));
+    }
+
+    CBMHashTable *dirty_set = NULL;
+    if (dirty_path_count > 0) {
+        dirty_set = cbm_ht_create((uint32_t)(dirty_path_count * PAIR_LEN + SKIP_ONE));
+        if (!dirty_set) {
+            free(temp_to_real);
+            return CBM_NOT_FOUND;
+        }
+        for (int i = 0; i < dirty_path_count; i++) {
+            const char *path = dirty_paths[i];
+            if (!path || path[0] == '\0' || cbm_ht_has(dirty_set, path)) {
+                continue;
+            }
+            cbm_ht_set(dirty_set, strdup(path), intptr_to_ptr(SKIP_ONE));
+        }
+    }
+
+    cbm_edge_t *edge_batch = NULL;
+    if (gb->edges.count > 0) {
+        edge_batch = malloc((size_t)gb->edges.count * sizeof(cbm_edge_t));
+        if (!edge_batch) {
+            if (dirty_set) {
+                cbm_ht_foreach(dirty_set, free_key_only, NULL);
+                cbm_ht_free(dirty_set);
+            }
+            free(temp_to_real);
+            return CBM_NOT_FOUND;
+        }
+    }
+
+    if (cbm_store_begin(store) != CBM_STORE_OK) {
+        if (dirty_set) {
+            cbm_ht_foreach(dirty_set, free_key_only, NULL);
+            cbm_ht_free(dirty_set);
+        }
+        free(edge_batch);
+        free(temp_to_real);
+        return CBM_NOT_FOUND;
+    }
+
+    int rc = 0;
+    int merged_nodes = 0;
+    int merged_edges = 0;
+    struct timespec phase_t;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &phase_t);
+    for (int i = 0; i < gb->nodes.count; i++) {
+        cbm_gbuf_node_t *n = gb->nodes.items[i];
+        if (!node_is_live(gb, n)) {
+            continue;
+        }
+
+        bool seeded = n->id > 0 && n->id < max_temp_id && temp_to_real[n->id] > 0;
+        bool dirty_file = dirty_set && n->file_path && n->file_path[0] != '\0' &&
+                          cbm_ht_has(dirty_set, n->file_path);
+        bool global_node = !n->file_path || n->file_path[0] == '\0';
+        if (seeded && !dirty_file && !global_node) {
+            continue;
+        }
+
+        cbm_node_t sn = {
+            .project = gb->project,
+            .label = n->label,
+            .name = n->name,
+            .qualified_name = n->qualified_name,
+            .file_path = n->file_path,
+            .start_line = n->start_line,
+            .end_line = n->end_line,
+            .properties_json = n->properties_json,
+        };
+        int64_t real_id = cbm_store_upsert_node(store, &sn);
+        if (real_id <= 0) {
+            rc = CBM_NOT_FOUND;
+            break;
+        }
+        if (n->id > 0 && n->id < max_temp_id) {
+            temp_to_real[n->id] = real_id;
+        }
+        merged_nodes++;
+    }
+    cbm_log_info("incremental.dbmerge.nodes", "count", gb_itoa(merged_nodes), "elapsed_ms",
+                 gb_itoa((int)gb_elapsed_ms(phase_t)));
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, &phase_t);
+    for (int i = 0; rc == 0 && i < gb->edges.count; i++) {
+        cbm_gbuf_edge_t *e = gb->edges.items[i];
+        int64_t real_src = (e->source_id > 0 && e->source_id < max_temp_id)
+                               ? temp_to_real[e->source_id]
+                               : 0;
+        int64_t real_tgt = (e->target_id > 0 && e->target_id < max_temp_id)
+                               ? temp_to_real[e->target_id]
+                               : 0;
+        if (real_src == 0 || real_tgt == 0) {
+            continue;
+        }
+
+        edge_batch[merged_edges++] = (cbm_edge_t){
+            .project = gb->project,
+            .source_id = real_src,
+            .target_id = real_tgt,
+            .type = e->type,
+            .properties_json = e->properties_json,
+        };
+    }
+    cbm_log_info("incremental.dbmerge.edge_map", "count", gb_itoa(merged_edges), "elapsed_ms",
+                 gb_itoa((int)gb_elapsed_ms(phase_t)));
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, &phase_t);
+    int inserted_edges = 0;
+    int updated_edges = 0;
+    if (rc == 0 && merged_edges > 0 &&
+        cbm_store_insert_or_upsert_edge_batch_stats_in_tx(store, edge_batch, merged_edges,
+                                                          &inserted_edges,
+                                                          &updated_edges) != CBM_STORE_OK) {
+        rc = CBM_NOT_FOUND;
+    }
+    cbm_log_info("incremental.dbmerge.edge_upsert", "count", gb_itoa(merged_edges),
+                 "inserted", gb_itoa(inserted_edges), "updated", gb_itoa(updated_edges),
+                 "elapsed_ms", gb_itoa((int)gb_elapsed_ms(phase_t)));
+
+    if (rc == 0) {
+        cbm_clock_gettime(CLOCK_MONOTONIC, &phase_t);
+        if (cbm_store_commit(store) != CBM_STORE_OK) {
+            rc = CBM_NOT_FOUND;
+        }
+        cbm_log_info("incremental.dbmerge.commit", "elapsed_ms",
+                     gb_itoa((int)gb_elapsed_ms(phase_t)));
+    } else {
+        cbm_store_rollback(store);
+    }
+
+    if (dirty_set) {
+        cbm_ht_foreach(dirty_set, free_key_only, NULL);
+        cbm_ht_free(dirty_set);
+    }
+    free(edge_batch);
+    free(temp_to_real);
+
+    if (rc == 0 && merged_nodes_out) {
+        *merged_nodes_out = merged_nodes;
+    }
+    if (rc == 0 && merged_edges_out) {
+        *merged_edges_out = merged_edges;
+    }
+    return rc;
 }

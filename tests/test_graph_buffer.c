@@ -139,6 +139,38 @@ TEST(gbuf_delete_by_label) {
     PASS();
 }
 
+TEST(gbuf_delete_by_files_cascades_edges) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    int64_t a1 = cbm_gbuf_upsert_node(gb, "Function", "a1", "pkg.a1", "a.go", 1, 5, "{}");
+    int64_t a2 = cbm_gbuf_upsert_node(gb, "Function", "a2", "pkg.a2", "a.go", 6, 10, "{}");
+    int64_t b1 = cbm_gbuf_upsert_node(gb, "Function", "b1", "pkg.b1", "b.go", 1, 5, "{}");
+    int64_t c1 = cbm_gbuf_upsert_node(gb, "Function", "c1", "pkg.c1", "c.go", 1, 5, "{}");
+
+    cbm_gbuf_insert_edge(gb, a1, c1, "CALLS", "{}");
+    cbm_gbuf_insert_edge(gb, c1, b1, "CALLS", "{}");
+    cbm_gbuf_insert_edge(gb, a2, b1, "CALLS", "{}");
+    ASSERT_EQ(cbm_gbuf_node_count(gb), 4);
+    ASSERT_EQ(cbm_gbuf_edge_count(gb), 3);
+
+    const char *paths[] = {"a.go", "a.go", "b.go"};
+    int deleted = cbm_gbuf_delete_by_files_logged(gb, paths, 3, false);
+    ASSERT_EQ(deleted, 3);
+    ASSERT_EQ(cbm_gbuf_node_count(gb), 1);
+    ASSERT_EQ(cbm_gbuf_edge_count(gb), 0);
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "pkg.a1"));
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "pkg.a2"));
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "pkg.b1"));
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gb, "pkg.c1"));
+
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_gbuf_find_by_label(gb, "Function", &nodes, &count), 0);
+    ASSERT_EQ(count, 1);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* ── Edge operations ───────────────────────────────────────────── */
 
 TEST(gbuf_insert_edge) {
@@ -939,6 +971,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_find_by_label);
     RUN_TEST(gbuf_find_by_name);
     RUN_TEST(gbuf_delete_by_label);
+    RUN_TEST(gbuf_delete_by_files_cascades_edges);
     RUN_TEST(gbuf_insert_edge);
     RUN_TEST(gbuf_edge_dedup);
     RUN_TEST(gbuf_find_edges_by_source_type);

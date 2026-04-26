@@ -298,6 +298,10 @@ int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const cha
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,
                                  cbm_node_t **out, int *count);
 
+/* Find all nodes in a project. */
+int cbm_store_find_nodes_by_project(cbm_store_t *s, const char *project, cbm_node_t **out,
+                                    int *count);
+
 /* Batch lookup: map qualified names → node IDs.
  * qns[i] is resolved; out_ids[i] receives the ID or 0 if not found.
  * Returns number of QNs actually found, or CBM_STORE_ERR. */
@@ -313,6 +317,10 @@ int cbm_store_delete_nodes_by_project(cbm_store_t *s, const char *project);
 /* Delete nodes by file path. */
 int cbm_store_delete_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path);
 
+/* Delete nodes by a batch of file paths. */
+int cbm_store_delete_nodes_by_files(cbm_store_t *s, const char *project,
+                                    const char **file_paths, int file_count);
+
 /* Delete nodes by label. */
 int cbm_store_delete_nodes_by_label(cbm_store_t *s, const char *project, const char *label);
 
@@ -323,6 +331,16 @@ int64_t cbm_store_insert_edge(cbm_store_t *s, const cbm_edge_t *e);
 
 /* Insert edges in batch. */
 int cbm_store_insert_edge_batch(cbm_store_t *s, const cbm_edge_t *edges, int count);
+int cbm_store_insert_edge_batch_stats_in_tx(cbm_store_t *s, const cbm_edge_t *edges, int count,
+                                            int *inserted_out);
+
+/* Upsert edges using caller-managed transaction; does not return edge IDs. */
+int cbm_store_upsert_edge_batch_in_tx(cbm_store_t *s, const cbm_edge_t *edges, int count);
+int cbm_store_upsert_edge_batch_stats_in_tx(cbm_store_t *s, const cbm_edge_t *edges, int count,
+                                            int *inserted_out, int *updated_out);
+int cbm_store_insert_or_upsert_edge_batch_stats_in_tx(cbm_store_t *s, const cbm_edge_t *edges,
+                                                      int count, int *inserted_out,
+                                                      int *updated_out);
 
 /* Find edges by source node. */
 int cbm_store_find_edges_by_source(cbm_store_t *s, int64_t source_id, cbm_edge_t **out, int *count);
@@ -341,6 +359,19 @@ int cbm_store_find_edges_by_target_type(cbm_store_t *s, int64_t target_id, const
 /* Find all edges of a type in project. */
 int cbm_store_find_edges_by_type(cbm_store_t *s, const char *project, const char *type,
                                  cbm_edge_t **out, int *count);
+
+/* Find distinct source file paths for edges targeting nodes in target_file_path.
+ * Empty source file paths and same-file sources are excluded. */
+int cbm_store_find_inbound_source_files_by_target_file(cbm_store_t *s, const char *project,
+                                                       const char *target_file_path,
+                                                       char ***out, int *count);
+
+/* Batch variant of cbm_store_find_inbound_source_files_by_target_file().
+ * Returns distinct source file paths for edges targeting any file in target_file_paths. */
+int cbm_store_find_inbound_source_files_by_target_files(cbm_store_t *s, const char *project,
+                                                        const char **target_file_paths,
+                                                        int target_file_count, char ***out,
+                                                        int *count);
 
 /* Count all edges in project. */
 int cbm_store_count_edges(cbm_store_t *s, const char *project);
@@ -365,6 +396,14 @@ int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash
 int cbm_store_delete_file_hash(cbm_store_t *s, const char *project, const char *rel_path);
 
 int cbm_store_delete_file_hashes(cbm_store_t *s, const char *project);
+
+/* Maintain contentless FTS rows for nodes in a single file. */
+int cbm_store_delete_nodes_fts_by_file(cbm_store_t *s, const char *project,
+                                       const char *file_path);
+int cbm_store_delete_nodes_fts_by_files(cbm_store_t *s, const char *project,
+                                        const char **file_paths, int file_count);
+int cbm_store_insert_nodes_fts_by_file(cbm_store_t *s, const char *project,
+                                       const char *file_path);
 
 /* ── Search ─────────────────────────────────────────────────────── */
 
@@ -607,6 +646,9 @@ void cbm_store_free_nodes(cbm_node_t *nodes, int count);
 
 /* Free an array of edges returned by find_edges_by_* functions. */
 void cbm_store_free_edges(cbm_edge_t *edges, int count);
+
+/* Free a string array returned by store helpers. */
+void cbm_store_free_strings(char **strings, int count);
 
 /* Free an array of projects. */
 void cbm_store_free_projects(cbm_project_t *projects, int count);

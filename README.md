@@ -300,6 +300,9 @@ codebase-memory-mcp cli list_projects
 codebase-memory-mcp cli --raw search_graph '{"label": "Function"}' | jq '.results[].name'
 ```
 
+`sync_files` and `sync_git_range` default to `mode: "fast"` for lightweight auto-sync;
+pass `mode: "full"` or `mode: "moderate"` when semantic edges need to be refreshed.
+
 ## MCP Tools
 
 ### Indexing

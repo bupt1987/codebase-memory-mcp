@@ -105,6 +105,9 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label);
 /* Delete all nodes for a given file path. Cascade-deletes referencing edges.
  * Used by incremental indexing to remove stale nodes before re-extraction. */
 int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path);
+int cbm_gbuf_delete_by_file_logged(cbm_gbuf_t *gb, const char *file_path, bool log_info);
+int cbm_gbuf_delete_by_files_logged(cbm_gbuf_t *gb, const char **file_paths, int file_count,
+                                    bool log_info);
 
 /* Bulk-load all nodes and edges for a project from an existing SQLite DB
  * into this graph buffer. Returns 0 on success. */
@@ -176,5 +179,16 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store);
  * Upserts nodes, inserts edges. Used for incremental indexing.
  * Returns 0 on success. */
 int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store);
+
+/* Merge only nodes touched by dirty files into an existing store.
+ * seed_temp_to_real maps seeded graph-buffer temp IDs to already-existing
+ * store IDs, so edges can still reference unchanged nodes without re-upserting
+ * them. merged_nodes_out and merged_edges_out receive the rows actually
+ * upserted. */
+int cbm_gbuf_merge_delta_into_store(cbm_gbuf_t *gb, cbm_store_t *store,
+                                    const char **dirty_paths, int dirty_path_count,
+                                    const int64_t *seed_temp_to_real,
+                                    int64_t seed_temp_to_real_count,
+                                    int *merged_nodes_out, int *merged_edges_out);
 
 #endif /* CBM_GRAPH_BUFFER_H */

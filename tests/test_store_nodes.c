@@ -1338,6 +1338,49 @@ TEST(store_delete_by_file_verify_remaining) {
     PASS();
 }
 
+TEST(store_delete_by_files_verify_remaining) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t n1 = {.project = "test",
+                     .label = "Function",
+                     .name = "A",
+                     .qualified_name = "test.A",
+                     .file_path = "delete_a.go"};
+    cbm_node_t n2 = {.project = "test",
+                     .label = "Function",
+                     .name = "B",
+                     .qualified_name = "test.B",
+                     .file_path = "keep_me.go"};
+    cbm_node_t n3 = {.project = "test",
+                     .label = "Function",
+                     .name = "C",
+                     .qualified_name = "test.C",
+                     .file_path = "delete_b.go"};
+    cbm_store_upsert_node(s, &n1);
+    cbm_store_upsert_node(s, &n2);
+    cbm_store_upsert_node(s, &n3);
+
+    const char *paths[] = {"delete_a.go", "delete_b.go"};
+    int rc = cbm_store_delete_nodes_by_files(s, "test", paths, 2);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_count_nodes(s, "test"), 1);
+
+    cbm_node_t found = {0};
+    rc = cbm_store_find_node_by_qn(s, "test", "test.B", &found);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_STR_EQ(found.file_path, "keep_me.go");
+    cbm_node_free_fields(&found);
+
+    rc = cbm_store_find_node_by_qn(s, "test", "test.A", &found);
+    ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
+    rc = cbm_store_find_node_by_qn(s, "test", "test.C", &found);
+    ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Edge case: upsert dedup with field changes ───────────────── */
 
 TEST(store_node_upsert_updates_fields) {
@@ -1548,6 +1591,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_batch_upsert_100);
     RUN_TEST(store_delete_by_label_verify_remaining);
     RUN_TEST(store_delete_by_file_verify_remaining);
+    RUN_TEST(store_delete_by_files_verify_remaining);
     RUN_TEST(store_node_upsert_updates_fields);
     RUN_TEST(store_node_long_qn);
     RUN_TEST(store_node_properties_special_chars);

@@ -11,6 +11,7 @@
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
 #include "discover/discover.h"
+#include "foundation/log.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -4314,6 +4315,47 @@ static void cleanup_incremental_repo(void) {
     th_rmtree(g_incr_tmpdir);
 }
 
+static char g_incr_log_capture[8192];
+
+static void incr_log_capture_sink(const char *line) {
+    if (!line || !strstr(line, "gbuf.delete_by_file")) {
+        return;
+    }
+    size_t used = strlen(g_incr_log_capture);
+    size_t cap = sizeof(g_incr_log_capture);
+    if (used + 2 >= cap) {
+        return;
+    }
+    snprintf(g_incr_log_capture + used, cap - used, "%s\n", line);
+}
+
+static void incr_db_merge_log_capture_sink(const char *line) {
+    if (!line || (!strstr(line, "incremental.db_merge") &&
+                  !strstr(line, "incremental.db_seed") &&
+                  !strstr(line, "incremental.load_db"))) {
+        return;
+    }
+    size_t used = strlen(g_incr_log_capture);
+    size_t cap = sizeof(g_incr_log_capture);
+    if (used + 2 >= cap) {
+        return;
+    }
+    snprintf(g_incr_log_capture + used, cap - used, "%s\n", line);
+}
+
+static int incr_log_extract_int(const char *log, const char *event, const char *key) {
+    const char *line = strstr(log, event);
+    if (!line) {
+        return -1;
+    }
+    const char *value = strstr(line, key);
+    if (!value) {
+        return -1;
+    }
+    value += strlen(key);
+    return atoi(value);
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  FastAPI Depends() edge tracking (PR #66, fix #27)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -4583,6 +4625,236 @@ TEST(incremental_explicit_files_handles_rename) {
     cbm_store_close(s);
 
     cbm_discover_free(files, file_count);
+    free(project);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_explicit_files_preserves_hashes_with_partial_file_set) {
+    /* Explicit sync paths should not require a full repository discover just to
+     * preserve file_hashes while the incremental dump rewrites the SQLite DB. */
+    if (setup_incremental_repo() != 0) {
+        SKIP("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/main.go", g_incr_tmpdir);
+    FILE *f = fopen(path, "a");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "\nfunc AddedForPartialSync() {}\n");
+    fclose(f);
+
+    struct stat st;
+    ASSERT_EQ(stat(path, &st), 0);
+    cbm_file_info_t changed = {
+        .path = strdup(path),
+        .rel_path = strdup("main.go"),
+        .language = CBM_LANG_GO,
+        .size = st.st_size,
+    };
+    ASSERT_NOT_NULL(changed.path);
+    ASSERT_NOT_NULL(changed.rel_path);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run_incremental_files(p, g_incr_dbpath, &changed, 1, NULL, 0,
+                                                 &changed, 1),
+              0);
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_file_hash_t *hashes = NULL;
+    int hash_count = 0;
+    ASSERT_EQ(cbm_store_get_file_hashes(s, project, &hashes, &hash_count), CBM_STORE_OK);
+
+    bool saw_main = false;
+    bool saw_helper = false;
+    for (int i = 0; i < hash_count; i++) {
+        if (strcmp(hashes[i].rel_path, "main.go") == 0) {
+            saw_main = true;
+        } else if (strcmp(hashes[i].rel_path, "helper.go") == 0) {
+            saw_helper = true;
+        }
+    }
+    ASSERT_TRUE(saw_main);
+    ASSERT_TRUE(saw_helper);
+
+    cbm_store_free_file_hashes(hashes, hash_count);
+    cbm_store_close(s);
+    free(changed.path);
+    free(changed.rel_path);
+    free(project);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_expands_callers_of_changed_file) {
+    /* If helper.go is changed, main.go must be re-parsed too because it has a
+     * CALLS edge into helper.go that is removed when helper.go nodes are purged. */
+    if (setup_incremental_repo() != 0) {
+        SKIP("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package main\n\nfunc Helper() string {\n\treturn \"changed\"\n}\n");
+    fclose(f);
+
+    struct stat st;
+    ASSERT_EQ(stat(path, &st), 0);
+    cbm_file_info_t changed = {
+        .path = strdup(path),
+        .rel_path = strdup("helper.go"),
+        .language = CBM_LANG_GO,
+        .size = st.st_size,
+    };
+    ASSERT_NOT_NULL(changed.path);
+    ASSERT_NOT_NULL(changed.rel_path);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run_incremental_files(p, g_incr_dbpath, &changed, 1, NULL, 0,
+                                                 &changed, 1),
+              0);
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count);
+
+    bool found_main_to_helper = false;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK &&
+            strcmp(src.name, "main") == 0 && strcmp(tgt.name, "Helper") == 0) {
+            found_main_to_helper = true;
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    cbm_store_close(s);
+    free(changed.path);
+    free(changed.rel_path);
+    free(project);
+    cleanup_incremental_repo();
+
+    ASSERT_TRUE(found_main_to_helper);
+    PASS();
+}
+
+TEST(incremental_fast_auto_run_uses_db_merge) {
+    if (setup_incremental_repo() != 0) {
+        SKIP("setup failed");
+    }
+
+    for (int i = 0; i < 20; i++) {
+        char rel[64];
+        char content[128];
+        snprintf(rel, sizeof(rel), "extra_%02d.go", i);
+        snprintf(content, sizeof(content),
+                 "package main\n\nfunc Extra%02d() int {\n\treturn %d\n}\n", i, i);
+        ASSERT_EQ(th_write_file(TH_PATH(g_incr_tmpdir, rel), content), 0);
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    ASSERT_EQ(th_write_file(TH_PATH(g_incr_tmpdir, "helper.go"),
+                            "package main\n\nfunc Helper() string {\n\treturn \"changed\"\n}\n"),
+              0);
+
+    g_incr_log_capture[0] = '\0';
+    cbm_log_set_sink(incr_db_merge_log_capture_sink);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    cbm_log_set_sink(NULL);
+    ASSERT_EQ(rc, 0);
+
+    ASSERT_NOT_NULL(strstr(g_incr_log_capture, "incremental.db_merge"));
+    ASSERT_NULL(strstr(g_incr_log_capture, "incremental.load_db"));
+    int seeded_nodes = incr_log_extract_int(g_incr_log_capture, "incremental.db_seed", "nodes=");
+    int merge_rc = incr_log_extract_int(g_incr_log_capture, "incremental.db_merge", "rc=");
+    int merged_nodes =
+        incr_log_extract_int(g_incr_log_capture, "incremental.db_merge", "nodes=");
+    int merged_edges =
+        incr_log_extract_int(g_incr_log_capture, "incremental.db_merge", "edges=");
+    ASSERT_EQ(merge_rc, 0);
+    ASSERT_GT(seeded_nodes, 0);
+    ASSERT_GT(merged_nodes, 0);
+    ASSERT_GT(merged_edges, 0);
+    ASSERT_LT(merged_nodes, seeded_nodes);
+
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_cbmignored_file_purges_without_delete_info_log) {
+    if (setup_incremental_repo() != 0) {
+        SKIP("setup failed");
+    }
+
+    ASSERT_EQ(th_write_file(TH_PATH(g_incr_tmpdir, "conf/global_dev/time_mock.php"),
+                            "<?php\nfunction time_mock() { return 1; }\n"),
+              0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    ASSERT_EQ(th_write_file(TH_PATH(g_incr_tmpdir, ".cbmignore"), "conf/\n"), 0);
+    g_incr_log_capture[0] = '\0';
+    cbm_log_set_sink(incr_log_capture_sink);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    cbm_log_set_sink(NULL);
+    ASSERT_EQ(rc, 0);
+
+    ASSERT_NULL(strstr(g_incr_log_capture, "gbuf.delete_by_file file=conf/global_dev/time_mock.php"));
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_file(s, project, "conf/global_dev/time_mock.php", &nodes,
+                                           &node_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(node_count, 0);
+    cbm_store_free_nodes(nodes, node_count);
+    cbm_store_close(s);
+
     free(project);
     cleanup_incremental_repo();
     PASS();
@@ -5418,6 +5690,10 @@ SUITE(pipeline) {
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
     RUN_TEST(incremental_explicit_files_handles_rename);
+    RUN_TEST(incremental_explicit_files_preserves_hashes_with_partial_file_set);
+    RUN_TEST(incremental_fast_expands_callers_of_changed_file);
+    RUN_TEST(incremental_fast_auto_run_uses_db_merge);
+    RUN_TEST(incremental_cbmignored_file_purges_without_delete_info_log);
     RUN_TEST(incremental_k8s_manifest_indexed);
     RUN_TEST(incremental_kustomize_module_indexed);
     /* Resource management & internal helper tests */

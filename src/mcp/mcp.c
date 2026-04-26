@@ -392,15 +392,14 @@ static const tool_def_t TOOLS[] = {
 
     {"sync_files",
      "Incrementally sync an indexed project from explicit changed/deleted file lists. Respects "
-     ".cbmignore by discovering the current repository and only re-indexing changed files that "
-     "are still indexable.",
+     ".cbmignore and only stats/re-indexes requested changed files that are still indexable.",
      "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\",\"description\":"
      "\"Path to the repository\"},\"changed_files\":{\"type\":\"array\",\"items\":{\"type\":"
      "\"string\"},\"description\":\"Relative paths to re-index\"},\"deleted_files\":{\"type\":"
      "\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Relative paths to delete from "
      "the index\"},\"indexed_head\":{\"type\":\"string\",\"description\":\"Optional git commit "
      "SHA recorded as the indexed head\"},\"mode\":{\"type\":\"string\",\"enum\":[\"full\","
-     "\"moderate\",\"fast\"],\"default\":\"full\"}},\"required\":[\"repo_path\"]}"},
+     "\"moderate\",\"fast\"],\"default\":\"fast\"}},\"required\":[\"repo_path\"]}"},
 
     {"sync_git_range",
      "Incrementally sync an indexed project from a git range. Uses git diff --name-status -M "
@@ -409,7 +408,7 @@ static const tool_def_t TOOLS[] = {
      "\"Path to the repository\"},\"old_ref\":{\"type\":\"string\",\"description\":\"Old git "
      "ref passed by post-checkout\"},\"new_ref\":{\"type\":\"string\",\"description\":\"New git "
      "ref passed by post-checkout\"},\"mode\":{\"type\":\"string\",\"enum\":[\"full\","
-     "\"moderate\",\"fast\"],\"default\":\"full\"}},\"required\":[\"repo_path\",\"old_ref\","
+     "\"moderate\",\"fast\"],\"default\":\"fast\"}},\"required\":[\"repo_path\",\"old_ref\","
      "\"new_ref\"]}"},
 
     {"manage_adr", "Create or update Architecture Decision Records",
@@ -2208,7 +2207,10 @@ static cbm_index_mode_t parse_index_mode_arg(const char *mode_str) {
     if (mode_str && strcmp(mode_str, "moderate") == 0) {
         return CBM_MODE_MODERATE;
     }
-    return CBM_MODE_FULL;
+    if (mode_str && strcmp(mode_str, "full") == 0) {
+        return CBM_MODE_FULL;
+    }
+    return CBM_MODE_FAST;
 }
 
 static char *git_single_line(const char *repo_path, const char *fmt_ref, const char *ref) {
@@ -2263,39 +2265,168 @@ static void update_project_indexed_head(const char *project, const char *repo_pa
     free(head);
 }
 
-static int collect_changed_file_infos(const sync_path_list_t *requested, cbm_file_info_t *all_files,
-                                      int all_file_count, cbm_file_info_t **out) {
-    cbm_file_info_t *changed =
-        requested->count > 0 ? calloc((size_t)requested->count, sizeof(cbm_file_info_t)) : NULL;
-    int count = 0;
-    for (int i = 0; i < requested->count; i++) {
-        for (int j = 0; j < all_file_count; j++) {
-            if (strcmp(requested->items[i], all_files[j].rel_path) == 0) {
-                changed[count++] = all_files[j];
-                break;
-            }
-        }
+static const char *sync_basename(const char *path) {
+    const char *slash = path ? strrchr(path, '/') : NULL;
+    return slash ? slash + SKIP_ONE : path;
+}
+
+static int sync_stat_file(const char *path, struct stat *st) {
+#ifdef _WIN32
+    if (stat(path, st) != 0) {
+        return CBM_NOT_FOUND;
     }
-    *out = changed;
-    return count;
+#else
+    if (lstat(path, st) != 0) {
+        return CBM_NOT_FOUND;
+    }
+#endif
+    return S_ISREG(st->st_mode) ? 0 : CBM_NOT_FOUND;
+}
+
+static char *sync_abs_path(const char *repo_path, const char *rel_path) {
+    size_t repo_len = strlen(repo_path);
+    size_t rel_len = strlen(rel_path);
+    bool need_sep = repo_len > 0 && repo_path[repo_len - SKIP_ONE] != '/';
+    char *abs_path = malloc(repo_len + rel_len + (need_sep ? PAIR_LEN : SKIP_ONE));
+    if (!abs_path) {
+        return NULL;
+    }
+    snprintf(abs_path, repo_len + rel_len + (need_sep ? PAIR_LEN : SKIP_ONE), "%s%s%s",
+             repo_path, need_sep ? "/" : "", rel_path);
+    return abs_path;
+}
+
+static bool sync_gitignore_matches_path(const cbm_gitignore_t *ignore, const char *rel_path) {
+    if (!ignore || !rel_path) {
+        return false;
+    }
+    if (cbm_gitignore_matches(ignore, rel_path, false)) {
+        return true;
+    }
+
+    char *dir = heap_strdup(rel_path);
+    if (!dir) {
+        return false;
+    }
+    bool matched = false;
+    for (char *slash = strchr(dir, '/'); slash; slash = strchr(slash + SKIP_ONE, '/')) {
+        *slash = '\0';
+        if (cbm_gitignore_matches(ignore, dir, true)) {
+            matched = true;
+            break;
+        }
+        *slash = '/';
+    }
+    free(dir);
+    return matched;
+}
+
+static bool sync_path_ignored(const char *rel_path, const char *base, cbm_index_mode_t mode,
+                              const cbm_gitignore_t *gitignore,
+                              const cbm_gitignore_t *cbmignore) {
+    if (cbm_has_ignored_suffix(base, mode) || cbm_should_skip_filename(base, mode) ||
+        cbm_matches_fast_pattern(base, mode)) {
+        return true;
+    }
+    if (sync_gitignore_matches_path(gitignore, rel_path)) {
+        return true;
+    }
+    if (sync_gitignore_matches_path(cbmignore, rel_path)) {
+        return true;
+    }
+    return false;
 }
 
 static int collect_deleted_paths(const char *repo_path, const sync_path_list_t *requested,
-                                 char ***out) {
+                                 cbm_index_mode_t mode, char ***out) {
     char **deleted =
         requested->count > 0 ? calloc((size_t)requested->count, sizeof(char *)) : NULL;
+    if (requested->count > 0 && !deleted) {
+        *out = NULL;
+        return 0;
+    }
+
     char ignore_path[CBM_SZ_1K];
+    snprintf(ignore_path, sizeof(ignore_path), "%s/.gitignore", repo_path);
+    cbm_gitignore_t *gitignore = cbm_gitignore_load(ignore_path);
     snprintf(ignore_path, sizeof(ignore_path), "%s/.cbmignore", repo_path);
-    cbm_gitignore_t *ignore = cbm_gitignore_load(ignore_path);
+    cbm_gitignore_t *cbmignore = cbm_gitignore_load(ignore_path);
+
     int count = 0;
     for (int i = 0; i < requested->count; i++) {
-        if (ignore && cbm_gitignore_matches(ignore, requested->items[i], false)) {
+        const char *rel_path = requested->items[i];
+        const char *base = sync_basename(rel_path);
+        if (sync_path_ignored(rel_path, base, mode, gitignore, cbmignore)) {
             continue;
         }
         deleted[count++] = requested->items[i];
     }
-    cbm_gitignore_free(ignore);
+
+    cbm_gitignore_free(gitignore);
+    cbm_gitignore_free(cbmignore);
     *out = deleted;
+    return count;
+}
+
+static int collect_changed_file_infos(const char *repo_path, const sync_path_list_t *requested,
+                                      cbm_index_mode_t mode, cbm_file_info_t **out) {
+    cbm_file_info_t *changed =
+        requested->count > 0 ? calloc((size_t)requested->count, sizeof(cbm_file_info_t)) : NULL;
+    if (requested->count > 0 && !changed) {
+        *out = NULL;
+        return 0;
+    }
+
+    char ignore_path[CBM_SZ_1K];
+    snprintf(ignore_path, sizeof(ignore_path), "%s/.gitignore", repo_path);
+    cbm_gitignore_t *gitignore = cbm_gitignore_load(ignore_path);
+    snprintf(ignore_path, sizeof(ignore_path), "%s/.cbmignore", repo_path);
+    cbm_gitignore_t *cbmignore = cbm_gitignore_load(ignore_path);
+
+    int count = 0;
+    for (int i = 0; i < requested->count; i++) {
+        const char *rel_path = requested->items[i];
+        const char *base = sync_basename(rel_path);
+        if (sync_path_ignored(rel_path, base, mode, gitignore, cbmignore)) {
+            continue;
+        }
+
+        char *abs_path = sync_abs_path(repo_path, rel_path);
+        if (!abs_path) {
+            continue;
+        }
+
+        struct stat st;
+        if (sync_stat_file(abs_path, &st) != 0) {
+            free(abs_path);
+            continue;
+        }
+
+        CBMLanguage lang = cbm_language_for_filename(base);
+        if (lang == CBM_LANG_COUNT) {
+            free(abs_path);
+            continue;
+        }
+        const char *dot = strrchr(base, '.');
+        if (dot && strcmp(dot, ".m") == 0) {
+            lang = cbm_disambiguate_m(abs_path);
+        }
+
+        changed[count].path = abs_path;
+        changed[count].rel_path = heap_strdup(rel_path);
+        changed[count].language = lang;
+        changed[count].size = st.st_size;
+        if (!changed[count].rel_path) {
+            free(changed[count].path);
+            memset(&changed[count], 0, sizeof(changed[count]));
+            continue;
+        }
+        count++;
+    }
+
+    cbm_gitignore_free(gitignore);
+    cbm_gitignore_free(cbmignore);
+    *out = changed;
     return count;
 }
 
@@ -2333,46 +2464,39 @@ static char *run_sync_file_lists(cbm_mcp_server_t *srv, const char *repo_path,
         return cbm_mcp_text_result("cannot derive project name", true);
     }
 
-    cbm_discover_opts_t opts = {.mode = mode, .ignore_file = NULL, .max_file_size = 0};
-    cbm_file_info_t *all_files = NULL;
-    int all_file_count = 0;
-    int discover_rc = cbm_discover(repo_path, &opts, &all_files, &all_file_count);
-    if (discover_rc != 0) {
-        free(project_name);
-        return cbm_mcp_text_result("failed to discover repository files", true);
-    }
-
     cbm_file_info_t *changed_files = NULL;
-    int changed_count =
-        collect_changed_file_infos(changed_paths, all_files, all_file_count, &changed_files);
+    int changed_count = collect_changed_file_infos(repo_path, changed_paths, mode, &changed_files);
     char **deleted_files = NULL;
-    int deleted_count = collect_deleted_paths(repo_path, deleted_paths, &deleted_files);
+    int deleted_count = collect_deleted_paths(repo_path, deleted_paths, mode, &deleted_files);
 
     char db_path[CBM_SZ_1K];
     project_db_path(project_name, db_path, sizeof(db_path));
 
-    cbm_pipeline_lock();
-    cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
-    if (p) {
-        srv->active_pipeline = p;
-    }
-    int rc = p ? cbm_pipeline_run_incremental_files(p, db_path, changed_files, changed_count,
-                                                    deleted_files, deleted_count, all_files,
-                                                    all_file_count)
-               : CBM_NOT_FOUND;
-    srv->active_pipeline = NULL;
-    if (p) {
-        cbm_pipeline_free(p);
-    }
-
+    int rc = 0;
     bool fallback = false;
-    if (rc != 0) {
-        fallback = true;
-        rc = run_full_index_fallback(srv, repo_path, mode);
-    } else {
-        invalidate_cached_store(srv);
+    if (changed_count > 0 || deleted_count > 0) {
+        cbm_pipeline_lock();
+        cbm_pipeline_t *p = cbm_pipeline_new(repo_path, NULL, mode);
+        if (p) {
+            srv->active_pipeline = p;
+        }
+        rc = p ? cbm_pipeline_run_incremental_files(p, db_path, changed_files, changed_count,
+                                                    deleted_files, deleted_count, changed_files,
+                                                    changed_count)
+               : CBM_NOT_FOUND;
+        srv->active_pipeline = NULL;
+        if (p) {
+            cbm_pipeline_free(p);
+        }
+
+        if (rc != 0) {
+            fallback = true;
+            rc = run_full_index_fallback(srv, repo_path, mode);
+        } else {
+            invalidate_cached_store(srv);
+        }
+        cbm_pipeline_unlock();
     }
-    cbm_pipeline_unlock();
 
     if (rc == 0) {
         update_project_indexed_head(project_name, repo_path, indexed_head);
@@ -2395,8 +2519,7 @@ static char *run_sync_file_lists(cbm_mcp_server_t *srv, const char *repo_path,
     yyjson_mut_doc_free(doc);
 
     free(deleted_files);
-    free(changed_files);
-    cbm_discover_free(all_files, all_file_count);
+    cbm_discover_free(changed_files, changed_count);
     free(project_name);
 
     char *result = cbm_mcp_text_result(json, rc != 0);
