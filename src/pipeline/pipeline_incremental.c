@@ -43,6 +43,8 @@ enum {
 #define CBM_MS_PER_SEC 1000.0
 #define CBM_NS_PER_MS 1000000.0
 #define CBM_NS_PER_SEC 1000000000LL
+#define INCR_BULK_WRITE_FILE_THRESHOLD 256
+#define INCR_DROP_EDGE_INDEX_THRESHOLD 100000
 
 /* ── Timing helper (same as pipeline.c) ──────────────────────────── */
 
@@ -408,7 +410,7 @@ static cbm_file_info_t *expand_changed_with_inbound_callers(
         cbm_ht_set(seen, deleted_files[i], deleted_files[i]);
     }
 
-    int target_count = changed_count + deleted_count;
+    int target_count = deleted_count;
     const char **target_files =
         target_count > 0 ? calloc((size_t)target_count, sizeof(char *)) : NULL;
     if (target_count > 0 && !target_files) {
@@ -417,11 +419,8 @@ static cbm_file_info_t *expand_changed_with_inbound_callers(
         *out_count = 0;
         return NULL;
     }
-    for (int i = 0; i < changed_count; i++) {
-        target_files[i] = changed_files[i].rel_path;
-    }
     for (int i = 0; i < deleted_count; i++) {
-        target_files[changed_count + i] = deleted_files[i];
+        target_files[i] = deleted_files[i];
     }
 
     char **source_files = NULL;
@@ -536,12 +535,36 @@ static int delete_files_from_store(cbm_store_t *store, const char *project,
         cbm_store_delete_file_hash(store, project, deleted_files[i]);
     }
 
-    if (cbm_store_delete_nodes_fts_by_files(store, project, paths, total_paths) != CBM_STORE_OK ||
-        cbm_store_delete_nodes_by_files(store, project, paths, total_paths) != CBM_STORE_OK) {
+    struct timespec phase_t;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &phase_t);
+    if (cbm_store_delete_nodes_fts_by_files(store, project, paths, total_paths) != CBM_STORE_OK) {
         free(paths);
         cbm_store_rollback(store);
         return CBM_NOT_FOUND;
     }
+    cbm_log_info("incremental.db_purge.fts_delete", "files", itoa_buf(total_paths),
+                 "elapsed_ms", itoa_buf((int)elapsed_ms(phase_t)));
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, &phase_t);
+    int deleted_edges = 0;
+    if (cbm_store_delete_edges_by_node_files(store, project, paths, total_paths,
+                                             &deleted_edges) != CBM_STORE_OK) {
+        free(paths);
+        cbm_store_rollback(store);
+        return CBM_NOT_FOUND;
+    }
+    cbm_log_info("incremental.db_purge.edge_delete", "files", itoa_buf(total_paths),
+                 "edges", itoa_buf(deleted_edges), "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(phase_t)));
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, &phase_t);
+    if (cbm_store_delete_nodes_by_files(store, project, paths, total_paths) != CBM_STORE_OK) {
+        free(paths);
+        cbm_store_rollback(store);
+        return CBM_NOT_FOUND;
+    }
+    cbm_log_info("incremental.db_purge.nodes_delete", "files", itoa_buf(total_paths),
+                 "elapsed_ms", itoa_buf((int)elapsed_ms(phase_t)));
 
     free(paths);
     return cbm_store_commit(store) == CBM_STORE_OK ? 0 : CBM_NOT_FOUND;
@@ -587,13 +610,39 @@ static int persist_fast_delta(cbm_store_t *store, const char *project, cbm_file_
         return CBM_NOT_FOUND;
     }
 
-    for (int i = 0; i < changed_count; i++) {
-        cbm_store_insert_nodes_fts_by_file(store, project, changed_files[i].rel_path);
+    struct timespec phase_t;
+    const char **changed_paths =
+        changed_count > 0 ? calloc((size_t)changed_count, sizeof(char *)) : NULL;
+    if (changed_count > 0 && !changed_paths) {
+        cbm_store_rollback(store);
+        return CBM_NOT_FOUND;
     }
+    for (int i = 0; i < changed_count; i++) {
+        changed_paths[i] = changed_files[i].rel_path;
+    }
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, &phase_t);
+    if (cbm_store_insert_nodes_fts_by_files(store, project, changed_paths, changed_count) !=
+        CBM_STORE_OK) {
+        free(changed_paths);
+        cbm_store_rollback(store);
+        return CBM_NOT_FOUND;
+    }
+    cbm_log_info("incremental.persist.fts_insert", "files", itoa_buf(changed_count),
+                 "elapsed_ms", itoa_buf((int)elapsed_ms(phase_t)));
+    free(changed_paths);
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, &phase_t);
     persist_hashes(store, project, changed_files, changed_count);
+    cbm_log_info("incremental.persist.hash_upsert", "files", itoa_buf(changed_count),
+                 "elapsed_ms", itoa_buf((int)elapsed_ms(phase_t)));
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, &phase_t);
     for (int i = 0; i < deleted_count; i++) {
         cbm_store_delete_file_hash(store, project, deleted_files[i]);
     }
+    cbm_log_info("incremental.persist.hash_delete", "files", itoa_buf(deleted_count),
+                 "elapsed_ms", itoa_buf((int)elapsed_ms(phase_t)));
 
     return cbm_store_commit(store) == CBM_STORE_OK ? 0 : CBM_NOT_FOUND;
 }
@@ -631,9 +680,51 @@ static int run_incremental_file_set_db_merge(cbm_pipeline_t *p, const char *db_p
                  "total_changed", itoa_buf(expanded_count), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
 
+    int bulk_path_count = expanded_count + deleted_count;
+    bool bulk_write = bulk_path_count >= INCR_BULK_WRITE_FILE_THRESHOLD;
+    if (bulk_write) {
+        if (cbm_store_begin_bulk(store) != CBM_STORE_OK) {
+            free_owned_file_infos(expanded_files, expanded_count);
+            cbm_store_close(store);
+            return CBM_NOT_FOUND;
+        }
+        cbm_log_info("incremental.db_bulk", "enabled", "1", "files", itoa_buf(bulk_path_count));
+    }
+
+    int inbound_ref_count = 0;
+    if (changed_count > 0) {
+        const char **changed_paths = calloc((size_t)changed_count, sizeof(char *));
+        if (!changed_paths) {
+            if (bulk_write) {
+                cbm_store_end_bulk(store);
+            }
+            free_owned_file_infos(expanded_files, expanded_count);
+            cbm_store_close(store);
+            return CBM_NOT_FOUND;
+        }
+        for (int i = 0; i < changed_count; i++) {
+            changed_paths[i] = changed_files[i].rel_path;
+        }
+        if (cbm_store_snapshot_inbound_edges_to_temp(store, project, changed_paths,
+                                                     changed_count, &inbound_ref_count) !=
+            CBM_STORE_OK) {
+            free(changed_paths);
+            if (bulk_write) {
+                cbm_store_end_bulk(store);
+            }
+            free_owned_file_infos(expanded_files, expanded_count);
+            cbm_store_close(store);
+            return CBM_NOT_FOUND;
+        }
+        free(changed_paths);
+    }
+
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     if (delete_files_from_store(store, project, expanded_files, expanded_count, deleted_files,
                                 deleted_count) != 0) {
+        if (bulk_write) {
+            cbm_store_end_bulk(store);
+        }
         free_owned_file_infos(expanded_files, expanded_count);
         cbm_store_close(store);
         return CBM_NOT_FOUND;
@@ -645,6 +736,9 @@ static int run_incremental_file_set_db_merge(cbm_pipeline_t *p, const char *db_p
         if (cbm_pipeline_repo_path(p) && cbm_artifact_exists(cbm_pipeline_repo_path(p))) {
             cbm_artifact_export(db_path, cbm_pipeline_repo_path(p), project, CBM_ARTIFACT_FAST);
         }
+        if (bulk_write) {
+            cbm_store_end_bulk(store);
+        }
         free_owned_file_infos(expanded_files, expanded_count);
         cbm_store_close(store);
         cbm_log_info("incremental.done", "elapsed_ms", itoa_buf((int)elapsed_ms(t0)));
@@ -655,6 +749,9 @@ static int run_incremental_file_set_db_merge(cbm_pipeline_t *p, const char *db_p
     int node_count = 0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     if (cbm_store_find_nodes_by_project(store, project, &nodes, &node_count) != CBM_STORE_OK) {
+        if (bulk_write) {
+            cbm_store_end_bulk(store);
+        }
         free_owned_file_infos(expanded_files, expanded_count);
         cbm_store_close(store);
         return CBM_NOT_FOUND;
@@ -666,6 +763,9 @@ static int run_incremental_file_set_db_merge(cbm_pipeline_t *p, const char *db_p
         cbm_registry_free(registry);
         cbm_gbuf_free(delta);
         cbm_store_free_nodes(nodes, node_count);
+        if (bulk_write) {
+            cbm_store_end_bulk(store);
+        }
         free_owned_file_infos(expanded_files, expanded_count);
         cbm_store_close(store);
         return CBM_NOT_FOUND;
@@ -677,6 +777,9 @@ static int run_incremental_file_set_db_merge(cbm_pipeline_t *p, const char *db_p
         cbm_registry_free(registry);
         cbm_gbuf_free(delta);
         cbm_store_free_nodes(nodes, node_count);
+        if (bulk_write) {
+            cbm_store_end_bulk(store);
+        }
         free_owned_file_infos(expanded_files, expanded_count);
         cbm_store_close(store);
         return CBM_NOT_FOUND;
@@ -707,12 +810,38 @@ static int run_incremental_file_set_db_merge(cbm_pipeline_t *p, const char *db_p
     cbm_pipeline_pass_k8s(&ctx, expanded_files, expanded_count);
     cbm_pipeline_pass_tests(&ctx, expanded_files, expanded_count);
 
+    bool edge_indexes_dropped = false;
+    int delta_edge_count = cbm_gbuf_edge_count(delta);
+    if (bulk_write && delta_edge_count >= INCR_DROP_EDGE_INDEX_THRESHOLD) {
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        if (cbm_store_drop_edge_indexes(store) != CBM_STORE_OK) {
+            free(seed_temp_to_real);
+            cbm_registry_free(registry);
+            cbm_gbuf_free(delta);
+            if (bulk_write) {
+                cbm_store_end_bulk(store);
+            }
+            free_owned_file_infos(expanded_files, expanded_count);
+            cbm_store_close(store);
+            return CBM_NOT_FOUND;
+        }
+        edge_indexes_dropped = true;
+        cbm_log_info("incremental.edge_indexes.drop", "edges", itoa_buf(delta_edge_count),
+                     "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+    }
+
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     const char **dirty_paths = calloc((size_t)expanded_count, sizeof(char *));
     if (!dirty_paths) {
+        if (edge_indexes_dropped) {
+            cbm_store_create_edge_indexes(store);
+        }
         free(seed_temp_to_real);
         cbm_registry_free(registry);
         cbm_gbuf_free(delta);
+        if (bulk_write) {
+            cbm_store_end_bulk(store);
+        }
         free_owned_file_infos(expanded_files, expanded_count);
         cbm_store_close(store);
         return CBM_NOT_FOUND;
@@ -733,15 +862,65 @@ static int run_incremental_file_set_db_merge(cbm_pipeline_t *p, const char *db_p
     cbm_registry_free(registry);
     cbm_gbuf_free(delta);
     if (merge_rc != 0) {
+        if (edge_indexes_dropped) {
+            cbm_store_create_edge_indexes(store);
+        }
+        if (bulk_write) {
+            cbm_store_end_bulk(store);
+        }
         free_owned_file_infos(expanded_files, expanded_count);
         cbm_store_close(store);
         return CBM_NOT_FOUND;
+    }
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    int restored_inbound = 0;
+    if (cbm_store_begin(store) != CBM_STORE_OK ||
+        cbm_store_restore_temp_inbound_edges_in_tx(store, project, &restored_inbound) !=
+            CBM_STORE_OK ||
+        cbm_store_commit(store) != CBM_STORE_OK) {
+        cbm_store_rollback(store);
+        if (edge_indexes_dropped) {
+            cbm_store_create_edge_indexes(store);
+        }
+        if (bulk_write) {
+            cbm_store_end_bulk(store);
+        }
+        free_owned_file_infos(expanded_files, expanded_count);
+        cbm_store_close(store);
+        return CBM_NOT_FOUND;
+    }
+    cbm_log_info("incremental.relink_inbound", "snapshots", itoa_buf(inbound_ref_count),
+                 "restored", itoa_buf(restored_inbound), "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t)));
+
+    if (edge_indexes_dropped) {
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        if (cbm_store_create_edge_indexes(store) != CBM_STORE_OK) {
+            if (bulk_write) {
+                cbm_store_end_bulk(store);
+            }
+            free_owned_file_infos(expanded_files, expanded_count);
+            cbm_store_close(store);
+            return CBM_NOT_FOUND;
+        }
+        cbm_log_info("incremental.edge_indexes.create", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t)));
     }
 
     int persist_rc =
         persist_fast_delta(store, project, expanded_files, expanded_count, deleted_files,
                            deleted_count);
     if (persist_rc != 0) {
+        if (bulk_write) {
+            cbm_store_end_bulk(store);
+        }
+        free_owned_file_infos(expanded_files, expanded_count);
+        cbm_store_close(store);
+        return CBM_NOT_FOUND;
+    }
+
+    if (bulk_write && cbm_store_end_bulk(store) != CBM_STORE_OK) {
         free_owned_file_infos(expanded_files, expanded_count);
         cbm_store_close(store);
         return CBM_NOT_FOUND;

@@ -48,6 +48,13 @@ typedef struct {
 } cbm_edge_t;
 
 typedef struct {
+    int64_t source_id;
+    const char *target_qualified_name;
+    const char *type;
+    const char *properties_json;
+} cbm_inbound_edge_ref_t;
+
+typedef struct {
     const char *name;
     const char *indexed_at; /* ISO 8601 */
     const char *root_path;
@@ -246,6 +253,12 @@ int cbm_store_drop_indexes(cbm_store_t *s);
 /* Recreate user indexes after bulk inserts. */
 int cbm_store_create_indexes(cbm_store_t *s);
 
+/* Drop only edge lookup indexes; node indexes stay available for purge/FTS paths. */
+int cbm_store_drop_edge_indexes(cbm_store_t *s);
+
+/* Recreate only edge lookup indexes after large edge batches. */
+int cbm_store_create_edge_indexes(cbm_store_t *s);
+
 /* ── WAL / Checkpoint ───────────────────────────────────────────── */
 
 /* Force WAL checkpoint + PRAGMA optimize. */
@@ -268,6 +281,9 @@ int cbm_store_delete_project(cbm_store_t *s, const char *name);
 
 /* Upsert a single node. Returns node ID (>0) or CBM_STORE_ERR. */
 int64_t cbm_store_upsert_node(cbm_store_t *s, const cbm_node_t *n);
+
+/* Insert a single node without conflict handling. Returns node ID (>0) or CBM_STORE_ERR. */
+int64_t cbm_store_insert_node(cbm_store_t *s, const cbm_node_t *n);
 
 /* Upsert nodes in batch. out_ids must have room for count entries. */
 int cbm_store_upsert_node_batch(cbm_store_t *s, const cbm_node_t *nodes, int count,
@@ -373,6 +389,34 @@ int cbm_store_find_inbound_source_files_by_target_files(cbm_store_t *s, const ch
                                                         int target_file_count, char ***out,
                                                         int *count);
 
+/* Delete edges whose source or target node belongs to one of file_paths. */
+int cbm_store_delete_edges_by_node_files(cbm_store_t *s, const char *project,
+                                         const char **file_paths, int file_count,
+                                         int *deleted_out);
+
+/* Snapshot inbound edges targeting nodes in target_file_paths. Source nodes from those same
+ * files are excluded because they will be rebuilt by the caller. */
+int cbm_store_snapshot_inbound_edges_by_target_files(cbm_store_t *s, const char *project,
+                                                     const char **target_file_paths,
+                                                     int target_file_count,
+                                                     cbm_inbound_edge_ref_t **out, int *count);
+
+/* Snapshot inbound edges into an internal temp table for a later restore. */
+int cbm_store_snapshot_inbound_edges_to_temp(cbm_store_t *s, const char *project,
+                                             const char **target_file_paths,
+                                             int target_file_count, int *count);
+
+/* Restore inbound edges previously snapshotted with cbm_store_snapshot_inbound_edges_to_temp().
+ * Caller manages the transaction. */
+int cbm_store_restore_temp_inbound_edges_in_tx(cbm_store_t *s, const char *project,
+                                               int *restored_out);
+
+/* Restore previously snapshotted inbound edges by resolving target qualified names to current
+ * node IDs. Caller manages the transaction. */
+int cbm_store_restore_inbound_edge_refs_in_tx(cbm_store_t *s, const char *project,
+                                              const cbm_inbound_edge_ref_t *refs, int count,
+                                              int *restored_out);
+
 /* Count all edges in project. */
 int cbm_store_count_edges(cbm_store_t *s, const char *project);
 
@@ -404,6 +448,8 @@ int cbm_store_delete_nodes_fts_by_files(cbm_store_t *s, const char *project,
                                         const char **file_paths, int file_count);
 int cbm_store_insert_nodes_fts_by_file(cbm_store_t *s, const char *project,
                                        const char *file_path);
+int cbm_store_insert_nodes_fts_by_files(cbm_store_t *s, const char *project,
+                                        const char **file_paths, int file_count);
 
 /* ── Search ─────────────────────────────────────────────────────── */
 
@@ -646,6 +692,9 @@ void cbm_store_free_nodes(cbm_node_t *nodes, int count);
 
 /* Free an array of edges returned by find_edges_by_* functions. */
 void cbm_store_free_edges(cbm_edge_t *edges, int count);
+
+/* Free an array of inbound edge refs returned by snapshot helpers. */
+void cbm_store_free_inbound_edge_refs(cbm_inbound_edge_ref_t *refs, int count);
 
 /* Free a string array returned by store helpers. */
 void cbm_store_free_strings(char **strings, int count);

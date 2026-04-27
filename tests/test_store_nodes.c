@@ -5,6 +5,7 @@
  * TestNodeDedup, TestProjectCRUD, TestUpsertNodeBatch, etc.)
  */
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <store/store.h>
 #include <sqlite3.h>
 #include <string.h>
@@ -190,6 +191,31 @@ TEST(store_node_dedup) {
     /* Should contain "updated" */
     ASSERT(strstr(found.properties_json, "updated") != NULL);
     cbm_node_free_fields(&found);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_node_insert_node_no_conflict) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t n = {.project = "test",
+                    .label = "Function",
+                    .name = "Inserted",
+                    .qualified_name = "test.Inserted",
+                    .file_path = "inserted.go",
+                    .properties_json = "{}"};
+    int64_t id = cbm_store_insert_node(s, &n);
+    ASSERT_GT(id, 0);
+
+    cbm_node_t found = {0};
+    ASSERT_EQ(cbm_store_find_node_by_id(s, id, &found), CBM_STORE_OK);
+    ASSERT_STR_EQ(found.qualified_name, "test.Inserted");
+    cbm_node_free_fields(&found);
+
+    ASSERT_EQ(cbm_store_insert_node(s, &n), CBM_STORE_ERR);
+    ASSERT_EQ(cbm_store_count_nodes(s, "test"), 1);
 
     cbm_store_close(s);
     PASS();
@@ -458,6 +484,52 @@ TEST(store_file_hash_crud) {
     cbm_store_free_file_hashes(hashes, count);
 
     cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_insert_nodes_fts_by_files) {
+    char *td = th_mktempdir("cbm_fts_batch");
+    char db_path[256];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", td);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", td), CBM_STORE_OK);
+
+    cbm_node_t a = {.project = "test",
+                    .label = "Function",
+                    .name = "AlphaBatch",
+                    .qualified_name = "test.a.AlphaBatch",
+                    .file_path = "a.go"};
+    cbm_node_t b = {.project = "test",
+                    .label = "Function",
+                    .name = "BetaBatch",
+                    .qualified_name = "test.b.BetaBatch",
+                    .file_path = "b.go"};
+    cbm_node_t c = {.project = "test",
+                    .label = "Function",
+                    .name = "GammaBatch",
+                    .qualified_name = "test.c.GammaBatch",
+                    .file_path = "c.go"};
+    ASSERT_GT(cbm_store_upsert_node(s, &a), 0);
+    ASSERT_GT(cbm_store_upsert_node(s, &b), 0);
+    ASSERT_GT(cbm_store_upsert_node(s, &c), 0);
+
+    const char *paths[] = {"a.go", "b.go"};
+    ASSERT_EQ(cbm_store_insert_nodes_fts_by_files(s, "test", paths, 2), CBM_STORE_OK);
+    cbm_store_close(s);
+
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(db_path, &db), SQLITE_OK);
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM nodes_fts;", -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    th_rmtree(td);
     PASS();
 }
 
@@ -1556,6 +1628,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_project_delete);
     RUN_TEST(store_node_crud);
     RUN_TEST(store_node_dedup);
+    RUN_TEST(store_node_insert_node_no_conflict);
     RUN_TEST(store_node_find_by_label);
     RUN_TEST(store_node_find_by_file);
     RUN_TEST(store_node_find_not_found);
@@ -1566,6 +1639,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_batch_empty);
     RUN_TEST(store_cascade_delete);
     RUN_TEST(store_file_hash_crud);
+    RUN_TEST(store_insert_nodes_fts_by_files);
     RUN_TEST(store_node_properties_json);
     RUN_TEST(store_node_null_properties);
     RUN_TEST(store_find_by_file_overlap);

@@ -265,6 +265,232 @@ TEST(store_edge_find_inbound_source_files_by_target_files) {
     PASS();
 }
 
+TEST(store_edge_snapshot_and_restore_inbound_edges_by_target_files) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t caller = {.project = "test",
+                         .label = "Function",
+                         .name = "Caller",
+                         .qualified_name = "test.Caller",
+                         .file_path = "caller.go"};
+    cbm_node_t target = {.project = "test",
+                         .label = "Function",
+                         .name = "Target",
+                         .qualified_name = "test.Target",
+                         .file_path = "target.go"};
+
+    int64_t caller_id = cbm_store_upsert_node(s, &caller);
+    int64_t old_target_id = cbm_store_upsert_node(s, &target);
+    cbm_store_insert_edge(
+        s, &(cbm_edge_t){.project = "test",
+                         .source_id = caller_id,
+                         .target_id = old_target_id,
+                         .type = "CALLS",
+                         .properties_json = "{\"line\":7}"});
+
+    const char *target_paths[] = {"target.go"};
+    cbm_inbound_edge_ref_t *refs = NULL;
+    int ref_count = 0;
+    ASSERT_EQ(cbm_store_snapshot_inbound_edges_by_target_files(s, "test", target_paths, 1,
+                                                               &refs, &ref_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(ref_count, 1);
+    ASSERT_EQ(refs[0].source_id, caller_id);
+    ASSERT_STR_EQ(refs[0].target_qualified_name, "test.Target");
+    ASSERT_STR_EQ(refs[0].type, "CALLS");
+
+    ASSERT_EQ(cbm_store_delete_nodes_by_files(s, "test", target_paths, 1), CBM_STORE_OK);
+    int64_t new_target_id = cbm_store_upsert_node(s, &target);
+    ASSERT_TRUE(new_target_id != old_target_id);
+
+    int restored = 0;
+    ASSERT_EQ(cbm_store_begin(s), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_restore_inbound_edge_refs_in_tx(s, "test", refs, ref_count, &restored),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_commit(s), CBM_STORE_OK);
+    ASSERT_EQ(restored, 1);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_type(s, "test", "CALLS", &edges, &edge_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(edge_count, 1);
+    ASSERT_EQ(edges[0].source_id, caller_id);
+    ASSERT_EQ(edges[0].target_id, new_target_id);
+    ASSERT_STR_EQ(edges[0].properties_json, "{\"line\":7}");
+
+    cbm_store_free_edges(edges, edge_count);
+    cbm_store_free_inbound_edge_refs(refs, ref_count);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_edge_snapshot_temp_and_restore_inbound_edges_by_target_files) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t caller = {.project = "test",
+                         .label = "Function",
+                         .name = "Caller",
+                         .qualified_name = "test.Caller",
+                         .file_path = "caller.go"};
+    cbm_node_t target = {.project = "test",
+                         .label = "Function",
+                         .name = "Target",
+                         .qualified_name = "test.Target",
+                         .file_path = "target.go"};
+
+    int64_t caller_id = cbm_store_upsert_node(s, &caller);
+    int64_t old_target_id = cbm_store_upsert_node(s, &target);
+    cbm_store_insert_edge(
+        s, &(cbm_edge_t){.project = "test",
+                         .source_id = caller_id,
+                         .target_id = old_target_id,
+                         .type = "CALLS",
+                         .properties_json = "{\"line\":11}"});
+
+    const char *target_paths[] = {"target.go"};
+    int snapshot_count = 0;
+    ASSERT_EQ(cbm_store_snapshot_inbound_edges_to_temp(s, "test", target_paths, 1,
+                                                       &snapshot_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(snapshot_count, 1);
+
+    ASSERT_EQ(cbm_store_delete_nodes_by_files(s, "test", target_paths, 1), CBM_STORE_OK);
+    int64_t new_target_id = cbm_store_upsert_node(s, &target);
+    ASSERT_TRUE(new_target_id != old_target_id);
+
+    int restored = 0;
+    ASSERT_EQ(cbm_store_begin(s), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_restore_temp_inbound_edges_in_tx(s, "test", &restored), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_commit(s), CBM_STORE_OK);
+    ASSERT_EQ(restored, 1);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_type(s, "test", "CALLS", &edges, &edge_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(edge_count, 1);
+    ASSERT_EQ(edges[0].source_id, caller_id);
+    ASSERT_EQ(edges[0].target_id, new_target_id);
+    ASSERT_STR_EQ(edges[0].properties_json, "{\"line\":11}");
+
+    cbm_store_free_edges(edges, edge_count);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_edge_restore_inbound_skips_deleted_sources) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t caller = {.project = "test",
+                         .label = "Function",
+                         .name = "Caller",
+                         .qualified_name = "test.Caller",
+                         .file_path = "caller.go"};
+    cbm_node_t target = {.project = "test",
+                         .label = "Function",
+                         .name = "Target",
+                         .qualified_name = "test.Target",
+                         .file_path = "target.go"};
+
+    int64_t caller_id = cbm_store_upsert_node(s, &caller);
+    cbm_store_insert_edge(
+        s, &(cbm_edge_t){.project = "test",
+                         .source_id = caller_id,
+                         .target_id = cbm_store_upsert_node(s, &target),
+                         .type = "CALLS",
+                         .properties_json = "{}"});
+
+    const char *target_paths[] = {"target.go"};
+    cbm_inbound_edge_ref_t *refs = NULL;
+    int ref_count = 0;
+    ASSERT_EQ(cbm_store_snapshot_inbound_edges_by_target_files(s, "test", target_paths, 1,
+                                                               &refs, &ref_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(ref_count, 1);
+
+    const char *purged_paths[] = {"caller.go", "target.go"};
+    ASSERT_EQ(cbm_store_delete_nodes_by_files(s, "test", purged_paths, 2), CBM_STORE_OK);
+    ASSERT_TRUE(cbm_store_upsert_node(s, &target) > 0);
+
+    int restored = 0;
+    ASSERT_EQ(cbm_store_begin(s), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_restore_inbound_edge_refs_in_tx(s, "test", refs, ref_count, &restored),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_commit(s), CBM_STORE_OK);
+    ASSERT_EQ(restored, 0);
+
+    cbm_store_free_inbound_edge_refs(refs, ref_count);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_edge_delete_by_node_files) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t dirty_src = {.project = "test",
+                            .label = "Function",
+                            .name = "DirtySource",
+                            .qualified_name = "test.DirtySource",
+                            .file_path = "dirty_source.go"};
+    cbm_node_t dirty_tgt = {.project = "test",
+                            .label = "Function",
+                            .name = "DirtyTarget",
+                            .qualified_name = "test.DirtyTarget",
+                            .file_path = "dirty_target.go"};
+    cbm_node_t clean_a = {.project = "test",
+                          .label = "Function",
+                          .name = "CleanA",
+                          .qualified_name = "test.CleanA",
+                          .file_path = "clean_a.go"};
+    cbm_node_t clean_b = {.project = "test",
+                          .label = "Function",
+                          .name = "CleanB",
+                          .qualified_name = "test.CleanB",
+                          .file_path = "clean_b.go"};
+    int64_t dirty_src_id = cbm_store_upsert_node(s, &dirty_src);
+    int64_t dirty_tgt_id = cbm_store_upsert_node(s, &dirty_tgt);
+    int64_t clean_a_id = cbm_store_upsert_node(s, &clean_a);
+    int64_t clean_b_id = cbm_store_upsert_node(s, &clean_b);
+
+    cbm_store_insert_edge(s, &(cbm_edge_t){.project = "test",
+                                           .source_id = dirty_src_id,
+                                           .target_id = clean_a_id,
+                                           .type = "CALLS",
+                                           .properties_json = "{}"});
+    cbm_store_insert_edge(s, &(cbm_edge_t){.project = "test",
+                                           .source_id = clean_a_id,
+                                           .target_id = dirty_tgt_id,
+                                           .type = "CALLS",
+                                           .properties_json = "{}"});
+    cbm_store_insert_edge(s, &(cbm_edge_t){.project = "test",
+                                           .source_id = clean_a_id,
+                                           .target_id = clean_b_id,
+                                           .type = "CALLS",
+                                           .properties_json = "{}"});
+
+    const char *dirty_paths[] = {"dirty_source.go", "dirty_target.go"};
+    int deleted = 0;
+    ASSERT_EQ(cbm_store_delete_edges_by_node_files(s, "test", dirty_paths, 2, &deleted),
+              CBM_STORE_OK);
+    ASSERT_EQ(deleted, 2);
+    ASSERT_EQ(cbm_store_count_edges(s, "test"), 1);
+
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source(s, clean_a_id, &edges, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(edges[0].target_id, clean_b_id);
+
+    cbm_store_free_edges(edges, count);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_edge_count_by_type) {
     int64_t ids[3];
     cbm_store_t *s = setup_store_with_nodes(3, ids);
@@ -526,6 +752,37 @@ TEST(store_edge_open_drops_unused_url_path_index) {
     cbm_store_close(s);
 
     ASSERT(!sqlite_index_exists_at_path(db_path, "idx_edges_url_path"));
+    cleanup_edge_schema_db(db_path);
+    PASS();
+}
+
+TEST(store_edge_drop_create_edge_indexes_preserves_node_indexes) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cbm_edge_indexes_%d.db", cbm_tmpdir(),
+             test_process_id());
+    cleanup_edge_schema_db(db_path);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT(sqlite_index_exists_at_path(db_path, "idx_edges_source"));
+    ASSERT(sqlite_index_exists_at_path(db_path, "idx_nodes_file"));
+
+    ASSERT_EQ(cbm_store_drop_edge_indexes(s), CBM_STORE_OK);
+    cbm_store_close(s);
+
+    ASSERT(!sqlite_index_exists_at_path(db_path, "idx_edges_source"));
+    ASSERT(!sqlite_index_exists_at_path(db_path, "idx_edges_target"));
+    ASSERT(!sqlite_index_exists_at_path(db_path, "idx_edges_type"));
+    ASSERT(sqlite_index_exists_at_path(db_path, "idx_nodes_file"));
+
+    s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_create_edge_indexes(s), CBM_STORE_OK);
+    cbm_store_close(s);
+
+    ASSERT(sqlite_index_exists_at_path(db_path, "idx_edges_source"));
+    ASSERT(sqlite_index_exists_at_path(db_path, "idx_edges_target"));
+    ASSERT(sqlite_index_exists_at_path(db_path, "idx_edges_type"));
     cleanup_edge_schema_db(db_path);
     PASS();
 }
@@ -850,6 +1107,10 @@ SUITE(store_edges) {
     RUN_TEST(store_edge_find_by_target_type);
     RUN_TEST(store_edge_find_by_type);
     RUN_TEST(store_edge_find_inbound_source_files_by_target_files);
+    RUN_TEST(store_edge_snapshot_and_restore_inbound_edges_by_target_files);
+    RUN_TEST(store_edge_snapshot_temp_and_restore_inbound_edges_by_target_files);
+    RUN_TEST(store_edge_restore_inbound_skips_deleted_sources);
+    RUN_TEST(store_edge_delete_by_node_files);
     RUN_TEST(store_edge_count_by_type);
     RUN_TEST(store_edge_delete_by_type);
     RUN_TEST(store_edge_properties_json);
@@ -860,6 +1121,7 @@ SUITE(store_edges) {
     RUN_TEST(store_edge_insert_batch_stats_in_tx_counts_plain_inserts);
     RUN_TEST(store_edge_insert_or_upsert_batch_falls_back_after_duplicate);
     RUN_TEST(store_edge_open_drops_unused_url_path_index);
+    RUN_TEST(store_edge_drop_create_edge_indexes_preserves_node_indexes);
     RUN_TEST(store_edge_batch_empty);
     RUN_TEST(store_edge_cascade_on_node_delete);
     /* Edge case tests */

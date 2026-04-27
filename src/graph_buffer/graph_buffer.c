@@ -1705,7 +1705,10 @@ int cbm_gbuf_merge_delta_into_store(cbm_gbuf_t *gb, cbm_store_t *store,
             .end_line = n->end_line,
             .properties_json = n->properties_json,
         };
-        int64_t real_id = cbm_store_upsert_node(store, &sn);
+        int64_t real_id = (dirty_file && !global_node) ? cbm_store_insert_node(store, &sn) : 0;
+        if (real_id <= 0) {
+            real_id = cbm_store_upsert_node(store, &sn);
+        }
         if (real_id <= 0) {
             rc = CBM_NOT_FOUND;
             break;

@@ -27,7 +27,7 @@ enum {
 #define PP_USEC_PER_MS 1000000ULL
 #define PP_HALF_CONF 0.5
 #define PP_FIELD_HINT_CONF 0.85
-enum { PP_CSHARP_M_PREFIX_LEN = 2 };
+enum { PP_CSHARP_M_PREFIX_LEN = 2, PP_RESOLVE_CACHE_MIN_CALLS = 16 };
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/worker_pool.h"
@@ -40,6 +40,7 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "foundation/slab_alloc.h"
 #include "foundation/mem.h"
 #include "foundation/str_util.h"
+#include "foundation/hash_table.h"
 #include "foundation/profile.h"
 #include "foundation/compat_regex.h"
 #include "cbm.h"
@@ -836,6 +837,54 @@ typedef struct {
     _Atomic int next_file_idx;
 } resolve_ctx_t;
 
+typedef struct {
+    cbm_resolution_t result;
+} resolve_cache_entry_t;
+
+typedef struct {
+    const char *enclosing_qn;
+    const cbm_gbuf_node_t *node;
+    bool valid;
+} source_node_cache_t;
+
+static void free_resolve_cache_entry(const char *key, void *value, void *userdata) {
+    (void)key;
+    (void)userdata;
+    free(value);
+}
+
+static void free_resolve_cache(CBMHashTable *cache) {
+    if (!cache) {
+        return;
+    }
+    cbm_ht_foreach(cache, free_resolve_cache_entry, NULL);
+    cbm_ht_free(cache);
+}
+
+static cbm_resolution_t resolve_registry_cached(resolve_ctx_t *rc, CBMHashTable *cache,
+                                                const char *callee_name, const char *module_qn,
+                                                const char **imp_keys, const char **imp_vals,
+                                                int imp_count) {
+    if (!cache || !callee_name) {
+        return cbm_registry_resolve(rc->registry, callee_name, module_qn, imp_keys, imp_vals,
+                                    imp_count);
+    }
+
+    resolve_cache_entry_t *entry = cbm_ht_get(cache, callee_name);
+    if (entry) {
+        return entry->result;
+    }
+
+    cbm_resolution_t result =
+        cbm_registry_resolve(rc->registry, callee_name, module_qn, imp_keys, imp_vals, imp_count);
+    entry = calloc(CBM_ALLOC_ONE, sizeof(*entry));
+    if (entry) {
+        entry->result = result;
+        cbm_ht_set(cache, callee_name, entry);
+    }
+    return result;
+}
+
 /* Minimum buffer space needed per arg JSON object */
 #define CBM_ARG_JSON_GUARD CBM_SZ_32
 
@@ -1393,6 +1442,32 @@ static const cbm_gbuf_node_t *find_source_node(const cbm_gbuf_t *gbuf, const cha
     return src;
 }
 
+static bool same_optional_string(const char *a, const char *b) {
+    if (a == b) {
+        return true;
+    }
+    if (!a || !b) {
+        return false;
+    }
+    return strcmp(a, b) == 0;
+}
+
+static const cbm_gbuf_node_t *find_source_node_cached(const cbm_gbuf_t *gbuf,
+                                                      const char *project, const char *rel,
+                                                      const char *enclosing_qn,
+                                                      source_node_cache_t *cache) {
+    if (cache && cache->valid && same_optional_string(cache->enclosing_qn, enclosing_qn)) {
+        return cache->node;
+    }
+    const cbm_gbuf_node_t *node = find_source_node(gbuf, project, rel, enclosing_qn);
+    if (cache) {
+        cache->enclosing_qn = enclosing_qn;
+        cache->node = node;
+        cache->valid = true;
+    }
+    return node;
+}
+
 /* Field type hint resolution for obj.Method() with multiple candidates.
  * Strips C# field prefixes (_ / m_), capitalizes to get type name, and
  * checks if TypeName.Method or ITypeName.Method exists among candidates. */
@@ -1450,20 +1525,22 @@ static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const 
 /* Resolve calls for one file and emit CALLS/HTTP_CALLS/ASYNC_CALLS edges. */
 static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
-                               const char **imp_vals, int imp_count) {
+                               const char **imp_vals, int imp_count, CBMHashTable *resolve_cache) {
+    source_node_cache_t source_cache = {0};
     for (int c = 0; c < result->calls.count; c++) {
         CBMCall *call = &result->calls.items[c];
         if (!call->callee_name) {
             continue;
         }
         const cbm_gbuf_node_t *source_node =
-            find_source_node(rc->main_gbuf, rc->project_name, rel, call->enclosing_func_qn);
+            find_source_node_cached(rc->main_gbuf, rc->project_name, rel,
+                                    call->enclosing_func_qn, &source_cache);
         if (!source_node) {
             continue;
         }
 
-        cbm_resolution_t res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn,
-                                                    imp_keys, imp_vals, imp_count);
+        cbm_resolution_t res = resolve_registry_cached(rc, resolve_cache, call->callee_name,
+                                                       module_qn, imp_keys, imp_vals, imp_count);
 
         try_field_type_hint(rc, &res, call->callee_name, source_node->id);
 
@@ -1492,13 +1569,15 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
 static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                 CBMFileResult *result, const char *rel, const char *module_qn,
                                 const char **imp_keys, const char **imp_vals, int imp_count) {
+    source_node_cache_t source_cache = {0};
     for (int u = 0; u < result->usages.count; u++) {
         CBMUsage *usage = &result->usages.items[u];
         if (!usage->ref_name) {
             continue;
         }
         const cbm_gbuf_node_t *src =
-            find_source_node(rc->main_gbuf, rc->project_name, rel, usage->enclosing_func_qn);
+            find_source_node_cached(rc->main_gbuf, rc->project_name, rel,
+                                    usage->enclosing_func_qn, &source_cache);
         if (!src) {
             continue;
         }
@@ -1549,13 +1628,15 @@ static void resolve_file_throws(resolve_ctx_t *rc, resolve_worker_state_t *ws,
 static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFileResult *result,
                             const char *rel, const char *module_qn, const char **imp_keys,
                             const char **imp_vals, int imp_count) {
+    source_node_cache_t source_cache = {0};
     for (int r = 0; r < result->rw.count; r++) {
         CBMReadWrite *rw = &result->rw.items[r];
         if (!rw->var_name) {
             continue;
         }
         const cbm_gbuf_node_t *src =
-            find_source_node(rc->main_gbuf, rc->project_name, rel, rw->enclosing_func_qn);
+            find_source_node_cached(rc->main_gbuf, rc->project_name, rel,
+                                    rw->enclosing_func_qn, &source_cache);
         if (!src) {
             continue;
         }
@@ -1698,7 +1779,13 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         char *module_qn = cbm_pipeline_fqn_module(rc->project_name, rel);
 
         /* ── CALLS resolution ──────────────────────────────────── */
-        resolve_file_calls(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count);
+        CBMHashTable *resolve_cache =
+            result->calls.count >= PP_RESOLVE_CACHE_MIN_CALLS
+                ? cbm_ht_create((uint32_t)result->calls.count * PAIR_LEN)
+                : NULL;
+        resolve_file_calls(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count,
+                           resolve_cache);
+        free_resolve_cache(resolve_cache);
 
         /* ── USAGE resolution ──────────────────────────────────── */
         resolve_file_usages(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count);

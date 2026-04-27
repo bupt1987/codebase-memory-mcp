@@ -4332,6 +4332,10 @@ static void incr_log_capture_sink(const char *line) {
 static void incr_db_merge_log_capture_sink(const char *line) {
     if (!line || (!strstr(line, "incremental.db_merge") &&
                   !strstr(line, "incremental.db_seed") &&
+                  !strstr(line, "incremental.expand") &&
+                  !strstr(line, "incremental.db_purge.") &&
+                  !strstr(line, "incremental.relink_inbound") &&
+                  !strstr(line, "incremental.persist.") &&
                   !strstr(line, "incremental.load_db"))) {
         return;
     }
@@ -4695,9 +4699,9 @@ TEST(incremental_explicit_files_preserves_hashes_with_partial_file_set) {
     PASS();
 }
 
-TEST(incremental_fast_expands_callers_of_changed_file) {
-    /* If helper.go is changed, main.go must be re-parsed too because it has a
-     * CALLS edge into helper.go that is removed when helper.go nodes are purged. */
+TEST(incremental_fast_relinks_inbound_edges_for_changed_file) {
+    /* Changing helper.go should not force unchanged callers through extraction,
+     * but the existing CALLS edge from main.go must survive the target-node purge. */
     if (setup_incremental_repo() != 0) {
         SKIP("setup failed");
     }
@@ -4726,12 +4730,23 @@ TEST(incremental_fast_expands_callers_of_changed_file) {
     ASSERT_NOT_NULL(changed.path);
     ASSERT_NOT_NULL(changed.rel_path);
 
+    g_incr_log_capture[0] = '\0';
+    cbm_log_set_sink(incr_db_merge_log_capture_sink);
+
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
-    ASSERT_EQ(cbm_pipeline_run_incremental_files(p, g_incr_dbpath, &changed, 1, NULL, 0,
-                                                 &changed, 1),
-              0);
+    int rc = cbm_pipeline_run_incremental_files(p, g_incr_dbpath, &changed, 1, NULL, 0,
+                                                &changed, 1);
     cbm_pipeline_free(p);
+    cbm_log_set_sink(NULL);
+    ASSERT_EQ(rc, 0);
+
+    ASSERT_NOT_NULL(strstr(g_incr_log_capture, "incremental.expand"));
+    ASSERT_EQ(incr_log_extract_int(g_incr_log_capture, "incremental.expand", "callers="), 0);
+    ASSERT_NOT_NULL(strstr(g_incr_log_capture, "incremental.relink_inbound"));
+    ASSERT_GT(incr_log_extract_int(g_incr_log_capture, "incremental.relink_inbound",
+                                   "restored="),
+              0);
 
     cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
     ASSERT_NOT_NULL(s);
@@ -4799,6 +4814,10 @@ TEST(incremental_fast_auto_run_uses_db_merge) {
     ASSERT_EQ(rc, 0);
 
     ASSERT_NOT_NULL(strstr(g_incr_log_capture, "incremental.db_merge"));
+    ASSERT_NOT_NULL(strstr(g_incr_log_capture, "incremental.db_purge.fts_delete"));
+    ASSERT_NOT_NULL(strstr(g_incr_log_capture, "incremental.db_purge.nodes_delete"));
+    ASSERT_NOT_NULL(strstr(g_incr_log_capture, "incremental.relink_inbound"));
+    ASSERT_NOT_NULL(strstr(g_incr_log_capture, "incremental.persist.fts_insert"));
     ASSERT_NULL(strstr(g_incr_log_capture, "incremental.load_db"));
     int seeded_nodes = incr_log_extract_int(g_incr_log_capture, "incremental.db_seed", "nodes=");
     int merge_rc = incr_log_extract_int(g_incr_log_capture, "incremental.db_merge", "rc=");
@@ -4809,8 +4828,11 @@ TEST(incremental_fast_auto_run_uses_db_merge) {
     ASSERT_EQ(merge_rc, 0);
     ASSERT_GT(seeded_nodes, 0);
     ASSERT_GT(merged_nodes, 0);
-    ASSERT_GT(merged_edges, 0);
+    ASSERT_TRUE(merged_edges >= 0);
     ASSERT_LT(merged_nodes, seeded_nodes);
+    ASSERT_GT(incr_log_extract_int(g_incr_log_capture, "incremental.relink_inbound",
+                                   "restored="),
+              0);
 
     cleanup_incremental_repo();
     PASS();
@@ -5691,7 +5713,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_new_file_added);
     RUN_TEST(incremental_explicit_files_handles_rename);
     RUN_TEST(incremental_explicit_files_preserves_hashes_with_partial_file_set);
-    RUN_TEST(incremental_fast_expands_callers_of_changed_file);
+    RUN_TEST(incremental_fast_relinks_inbound_edges_for_changed_file);
     RUN_TEST(incremental_fast_auto_run_uses_db_merge);
     RUN_TEST(incremental_cbmignored_file_purges_without_delete_info_log);
     RUN_TEST(incremental_k8s_manifest_indexed);
